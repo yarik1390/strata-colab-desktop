@@ -26,7 +26,7 @@ if session_exists; then
     if [[ "${USE_DRIVE:-1}" == 1 ]]; then
         msg st_drive "$DRIVE_DATA_DIR"; echo
         q_dd="$(printf '%q' "$DRIVE_DATA_DIR")"
-        rssh "if [[ -d $q_dd ]]; then find $q_dd -name '*.gguf' -exec ls -lh {} + 2>/dev/null | awk '{print \$9, \"(\" \$5 \")\"}'; else echo 'Not mounted or empty'; fi; [[ -f /tmp/strata-drive-sync.status ]] && echo \"Sync status: \$(cat /tmp/strata-drive-sync.status)\"" \
+        rssh "if [[ -d $q_dd ]]; then find $q_dd -name '*.gguf' -exec ls -lh {} + 2>/dev/null | awk '{print \$9, \"(\" \$5 \")\"}'; if [[ -d $q_dd/strata-config ]]; then for g in $q_dd/strata-config/*; do [[ -d \"\$g\" ]] || continue; n=\$(find \"\$g/presets\" -maxdepth 1 -name '*.json' ! -name 'active.json' 2>/dev/null | wc -l); echo \"Config [\$(basename \"\$g\")]: \$n tuned preset(s)\"; done; fi; else echo 'Not mounted or empty'; fi; [[ -f /tmp/strata-drive-sync.status ]] && echo \"Sync status: \$(cat /tmp/strata-drive-sync.status)\"; [[ -f /tmp/strata-config-sync.status ]] && echo \"Config sync: \$(cat /tmp/strata-config-sync.status)\"" \
             2>/dev/null | sed 's/^/    /' || true
     fi
 else

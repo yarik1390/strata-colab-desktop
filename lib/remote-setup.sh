@@ -264,33 +264,112 @@ USE_DRIVE="${USE_DRIVE:-1}"
 DRIVE_DATA_DIR="${DRIVE_DATA_DIR:-/content/drive/MyDrive/Strata-data}"
 DRIVE_CACHE_SCRIPT="/tmp/strata-drive-cache.py"
 DRIVE_SYNC_STATUS="/tmp/strata-drive-sync.status"
+DRIVE_CONFIG_STATUS="/tmp/strata-config-sync.status"
 
 cat > "$DRIVE_CACHE_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
+import glob
+import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.request
 
 STATUS_FILE = "/tmp/strata-drive-sync.status"
+CONFIG_STATUS_FILE = "/tmp/strata-config-sync.status"
+PRESET_DIR = os.path.expanduser("~/.config/strata/presets")
+PROFILE_DIR = os.path.expanduser("~/.config/strata/profiles")
+DESKTOP_STATE_FILE = os.path.expanduser("~/.strata/data/state.json")
+SKIP_CONFIG_NAMES = {"last-failed-engine.log"}
+SKIP_SUFFIXES = (".tmp", ".part", ".incomplete", ".lock")
 SHARED_KEYWORDS = ("mmproj", "mtp", "ple-fp8", "token-embd", "dense.gguf", "dflash2", ".json")
+CALIBRATE_MARKERS = (
+    "calibrate_config",
+    "strata.py\x00tune",
+    "strata.py\x00presets\x00recheck",
+    "strata.py\x00calibrate",
+    "native-tune/tune-",
+)
+SAFE_PERSISTENT_KEYS = (
+    "ui_resource_profile",
+    "vram_reserve_mib",
+    "ui_reserve_applied",
+    "ui_resource_baseline",
+    "ui_vision_enabled",
+    "ui_vision_device",
+    "ui_vision_chosen",
+    "env",
+    "sampling",
+    "parallel",
+    "layer_split",
+    "user_args",
+)
+
+
+def write_file_atomic(path: str, data: bytes, mode: int | None = None) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o700 if mode is not None else 0o755, exist_ok=True)
+        if mode is not None:
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def _write_status_file(path: str, text: str) -> None:
+    try:
+        write_file_atomic(path, (text + "\n").encode("utf-8"))
+    except OSError:
+        pass
 
 
 def write_status(text: str) -> None:
+    _write_status_file(STATUS_FILE, text)
+
+
+def write_config_status(text: str) -> None:
+    _write_status_file(CONFIG_STATUS_FILE, text)
+
+
+def detect_gpu_slug() -> str:
     try:
-        with open(STATUS_FILE + ".tmp", "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-        os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
-    except OSError:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        for line in out.splitlines():
+            line = line.strip().lower()
+            if line:
+                slug = re.sub(r"[^a-z0-9]+", "-", line).strip("-")
+                if slug:
+                    return slug
+    except Exception:
         pass
+    return "default"
 
 
 def matches_model(rel_path: str, model: str) -> bool:
     low = rel_path.lower().replace("\\", "/")
     if low.endswith(".part") or low.endswith(".tmp") or low.endswith(".incomplete") or low.endswith(".lock"):
         return False
-    if low.startswith("conversation-spill/"):
+    if low.startswith("conversation-spill/") or low.startswith("strata-config/"):
         return False
     base = low[:-5] if low.endswith(".done") else low
     if model and model.lower() in base:
@@ -328,11 +407,390 @@ def copy_with_progress(src: str, dst: str, label: str, update_status: bool = Fal
         pass
 
 
+def _json_canonical_bytes(obj: dict) -> bytes:
+    return (json.dumps(obj, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def sanitize_run_config(raw: bytes) -> bytes | None:
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.pop("api_key", None)
+    return _json_canonical_bytes(data)
+
+
+def sanitize_desktop_state(raw: bytes) -> bytes | None:
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("serving"), dict):
+        data["serving"]["apiKey"] = None
+    return _json_canonical_bytes(data)
+
+
+def sync_bytes_if_changed(dst: str, payload: bytes, local_mode: int | None = None) -> bool:
+    if os.path.isfile(dst):
+        try:
+            with open(dst, "rb") as f:
+                if f.read() == payload:
+                    return False
+        except OSError:
+            pass
+    write_file_atomic(dst, payload, mode=local_mode)
+    return True
+
+
+def _sync_dir_files(src_dir: str, dst_dir: str, *, json_only: bool = False) -> int:
+    if not os.path.isdir(src_dir):
+        return 0
+    changed = 0
+    for fn in sorted(os.listdir(src_dir)):
+        if fn.startswith(".") or fn in SKIP_CONFIG_NAMES or fn.endswith(SKIP_SUFFIXES):
+            continue
+        if json_only and not fn.endswith(".json"):
+            continue
+        src = os.path.join(src_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        try:
+            with open(src, "rb") as f:
+                raw = f.read()
+            if sync_bytes_if_changed(os.path.join(dst_dir, fn), raw):
+                changed += 1
+        except OSError:
+            pass
+    return changed
+
+
+def _run_config_paths(remote_dir: str) -> list[str]:
+    paths = glob.glob(os.path.join(remote_dir, "strata-*.json")) + glob.glob(
+        os.path.join(remote_dir, "terminal", "strata-*.json")
+    )
+    return sorted(p for p in paths if os.path.isfile(p))
+
+
+def cmd_sync_config(drive_dir: str, remote_dir: str) -> int:
+    drive_parent = os.path.dirname(drive_dir.rstrip("/"))
+    if not os.path.isdir(drive_parent):
+        return 0
+    slug = detect_gpu_slug()
+    cfg_root = os.path.join(drive_dir, "strata-config", slug)
+    presets_dst = os.path.join(cfg_root, "presets")
+
+    changed = 0
+    changed += _sync_dir_files(PRESET_DIR, presets_dst, json_only=False)
+    changed += _sync_dir_files(PROFILE_DIR, os.path.join(cfg_root, "profiles"), json_only=True)
+
+    run_cfgs_dst = os.path.join(cfg_root, "run-configs")
+    for src in _run_config_paths(remote_dir):
+        try:
+            with open(src, "rb") as f:
+                payload = sanitize_run_config(f.read())
+            if payload is not None and sync_bytes_if_changed(
+                os.path.join(run_cfgs_dst, os.path.basename(src)), payload
+            ):
+                changed += 1
+        except OSError:
+            pass
+
+    if os.path.isfile(DESKTOP_STATE_FILE):
+        try:
+            with open(DESKTOP_STATE_FILE, "rb") as f:
+                payload = sanitize_desktop_state(f.read())
+            if payload is not None and sync_bytes_if_changed(
+                os.path.join(cfg_root, "desktop", "state.json"), payload
+            ):
+                changed += 1
+        except OSError:
+            pass
+
+    preset_count = 0
+    if os.path.isdir(presets_dst):
+        preset_count = sum(
+            1
+            for fn in os.listdir(presets_dst)
+            if fn.endswith(".json") and fn != "active.json" and os.path.isfile(os.path.join(presets_dst, fn))
+        )
+
+    if changed > 0:
+        print(f"[config-sync] Synced {changed} file(s) to {cfg_root}", flush=True)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_config_status(f"SYNCED:{slug}:{preset_count}_presets:{ts}")
+    elif preset_count > 0 and not os.path.isfile(CONFIG_STATUS_FILE):
+        write_config_status(f"UP_TO_DATE:{slug}:{preset_count}_presets")
+    return 0
+
+
+def _restore_dir_files(
+    src_dir: str,
+    dst_dir: str,
+    *,
+    json_only: bool = False,
+    only_if_missing: bool = False,
+) -> int:
+    if not os.path.isdir(src_dir):
+        return 0
+    restored = 0
+    for fn in sorted(os.listdir(src_dir)):
+        if fn.startswith(".") or fn in SKIP_CONFIG_NAMES or fn.endswith(SKIP_SUFFIXES):
+            continue
+        if json_only and not fn.endswith(".json"):
+            continue
+        src = os.path.join(src_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(dst_dir, fn)
+        if only_if_missing and os.path.exists(dst):
+            continue
+        try:
+            st = os.stat(src)
+            if os.path.isfile(dst):
+                dst_st = os.stat(dst)
+                if st.st_mtime <= dst_st.st_mtime + 1e-6:
+                    continue
+            with open(src, "rb") as f:
+                payload = f.read()
+            if sync_bytes_if_changed(dst, payload, local_mode=0o600):
+                try:
+                    os.utime(dst, (st.st_atime, st.st_mtime))
+                except OSError:
+                    pass
+                restored += 1
+        except OSError:
+            pass
+    return restored
+
+
+def _arg_val(args: list, flag: str) -> str | None:
+    for i in range(len(args) - 1):
+        if str(args[i]) == flag:
+            return str(args[i + 1])
+    return None
+
+
+def _set_arg_val(args: list, flag: str, value: str) -> None:
+    for i in range(len(args) - 1):
+        if str(args[i]) == flag:
+            args[i + 1] = value
+
+
+def _find_active_preset_goal(
+    model_name: str,
+    ctx_int: int | None,
+    *,
+    model_id_hint: str = "",
+    preferred_profile: str = "",
+) -> str | None:
+    idx_path = os.path.join(PRESET_DIR, "active.json")
+    if not os.path.isfile(idx_path):
+        return None
+    try:
+        with open(idx_path, "r", encoding="utf-8-sig") as f:
+            idx = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(idx, dict):
+        return None
+
+    m_low = model_name.strip().lower()
+    hint_low = model_id_hint.strip().lower()
+    pref_goal = "room" if preferred_profile == "work" else ("speed" if preferred_profile == "performance" else "")
+
+    matches: list[tuple[int, float, str]] = []
+    for entry in idx.values():
+        if not isinstance(entry, dict):
+            continue
+        pid = entry.get("active")
+        if not pid or not isinstance(pid, str):
+            continue
+        pfile = os.path.join(PRESET_DIR, f"{pid}.json")
+        if not os.path.isfile(pfile):
+            continue
+        try:
+            with open(pfile, "r", encoding="utf-8-sig") as f:
+                preset = json.load(f)
+        except Exception:
+            continue
+        choices = preset.get("choices") or {}
+        pm = str(choices.get("model") or "").strip().lower()
+        pctx = choices.get("context")
+        goal = choices.get("goal")
+        if goal not in ("room", "speed"):
+            continue
+        if ctx_int is not None and pctx != ctx_int:
+            continue
+        if m_low:
+            if pm != m_low and not (hint_low and hint_low in pm):
+                continue
+        elif hint_low:
+            if hint_low not in pm:
+                continue
+        pref_score = 1 if (pref_goal and goal == pref_goal) else 0
+        created = float(preset.get("created_epoch") or 0.0)
+        matches.append((pref_score, created, goal))
+
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return matches[0][2]
+
+
+def cmd_restore_config(
+    drive_dir: str,
+    remote_dir: str,
+    phase: str,
+    context: str = "",
+    port: str = "",
+    ui_mode: str = "desktop",
+) -> int:
+    slug = detect_gpu_slug()
+    cfg_root = os.path.join(drive_dir, "strata-config", slug) if drive_dir else ""
+
+    if phase == "pre":
+        if not cfg_root or not os.path.isdir(cfg_root):
+            return 0
+        n = 0
+        n += _restore_dir_files(os.path.join(cfg_root, "presets"), PRESET_DIR, json_only=False)
+        n += _restore_dir_files(os.path.join(cfg_root, "profiles"), PROFILE_DIR, json_only=True)
+        n += _restore_dir_files(
+            os.path.join(cfg_root, "desktop"),
+            os.path.dirname(DESKTOP_STATE_FILE),
+            json_only=True,
+            only_if_missing=True,
+        )
+        if n > 0:
+            print(f"[remote] Restored {n} tuned preset/config file(s) for {slug} from Google Drive.", flush=True)
+        return 0
+
+    if phase == "post":
+        saved_dir = os.path.join(cfg_root, "run-configs") if cfg_root else ""
+        ctx_int = int(context) if context and context.isdigit() else None
+        applied_any = False
+
+        for local_path in _run_config_paths(remote_dir):
+            try:
+                with open(local_path, "r", encoding="utf-8-sig") as f:
+                    cfg = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(cfg, dict):
+                continue
+
+            saved_path = os.path.join(saved_dir, os.path.basename(local_path)) if saved_dir else ""
+            if saved_dir and os.path.isdir(saved_dir) and os.path.isfile(saved_path):
+                try:
+                    with open(saved_path, "r", encoding="utf-8-sig") as f:
+                        saved = json.load(f)
+                except Exception:
+                    saved = None
+                if isinstance(saved, dict) and saved.get("model_name") == cfg.get("model_name"):
+                    saved_args = saved.get("args") if isinstance(saved.get("args"), list) else []
+                    native_path = _arg_val(saved_args, "--native")
+                    native_ok = (not native_path) or os.path.isfile(native_path)
+                    if native_ok:
+                        saved_ctx = _arg_val(saved_args, "--max-context")
+                        if not context or saved_ctx == context:
+                            if saved_args:
+                                cfg["args"] = list(saved_args)
+                            if isinstance(saved.get("args_written"), list) and saved["args_written"]:
+                                cfg["args_written"] = list(saved["args_written"])
+                        for key in SAFE_PERSISTENT_KEYS:
+                            if key in saved and saved[key] is not None:
+                                cfg[key] = saved[key]
+                        applied_any = True
+
+            if context:
+                for k in ("args", "args_written"):
+                    arr = cfg.get(k)
+                    if isinstance(arr, list):
+                        _set_arg_val(arr, "--max-context", context)
+            if port and ui_mode == "desktop":
+                try:
+                    cfg["port"] = int(port)
+                except ValueError:
+                    pass
+                cfg["ui_context_chosen"] = True
+
+            if not cfg.get("ui_resource_profile"):
+                goal = _find_active_preset_goal(str(cfg.get("model_name") or ""), ctx_int)
+                if goal == "room":
+                    cfg["ui_resource_profile"] = "work"
+                    applied_any = True
+                elif goal == "speed":
+                    cfg["ui_resource_profile"] = "performance"
+                    applied_any = True
+
+            try:
+                write_file_atomic(local_path, _json_canonical_bytes(cfg))
+            except OSError:
+                pass
+
+        if applied_any:
+            print(f"[remote] Applied persisted GPU config/preset alignment for {slug}.", flush=True)
+        return 0
+
+    return 1
+
+
+def cmd_load_profile(remote_dir: str, model_id: str, context: str = "") -> int:
+    ctx_int = int(context) if context and context.isdigit() else None
+    target_name = f"strata-{model_id.lower()}.json"
+    matched_cfg: dict = {}
+
+    for p in _run_config_paths(remote_dir):
+        if os.path.basename(p).lower() == target_name:
+            try:
+                with open(p, "r", encoding="utf-8-sig") as f:
+                    matched_cfg = json.load(f)
+            except Exception:
+                matched_cfg = {}
+            break
+
+    if not matched_cfg:
+        for p in _run_config_paths(remote_dir):
+            try:
+                with open(p, "r", encoding="utf-8-sig") as f:
+                    cand = json.load(f)
+                if str(cand.get("model_name") or "").lower() == model_id.lower():
+                    matched_cfg = cand
+                    break
+            except Exception:
+                pass
+
+    model_name = str(matched_cfg.get("model_name") or "")
+    ui_profile = str(matched_cfg.get("ui_resource_profile") or "")
+    goal = _find_active_preset_goal(
+        model_name,
+        ctx_int,
+        model_id_hint=model_id,
+        preferred_profile=ui_profile,
+    )
+    if goal == "room":
+        print("work")
+        return 0
+    if goal == "speed":
+        print("performance")
+        return 0
+    if ui_profile in ("work", "performance"):
+        print(ui_profile)
+        return 0
+    return 0
+
+
 def cmd_restore(drive_dir: str, data_dir: str, model: str) -> int:
     if not os.path.isdir(drive_dir):
         return 0
     candidates = []
     for root, _, files in os.walk(drive_dir):
+        rel_root = os.path.relpath(root, drive_dir).replace("\\", "/")
+        if rel_root == "strata-config" or rel_root.startswith("strata-config/"):
+            continue
         for fn in sorted(files):
             if fn.endswith(".done") or fn.endswith(".tmp") or fn.endswith(".part"):
                 continue
@@ -387,85 +845,132 @@ def is_calibrating() -> bool:
                 continue
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 cmd = f.read().decode("utf-8", errors="ignore")
-            if "calibrate_config" in cmd or "strata.py\x00tune" in cmd:
+            if "strata-drive-cache.py" in cmd:
+                continue
+            if any(marker in cmd for marker in CALIBRATE_MARKERS):
                 return True
     except Exception:
         pass
     return False
 
 
-def cmd_backup_loop(data_dir: str, drive_dir: str, port: str) -> int:
+def cmd_watch_config(drive_dir: str, remote_dir: str) -> int:
+    drive_parent = os.path.dirname(drive_dir.rstrip("/"))
+    if not os.path.isdir(drive_parent):
+        return 0
+    while True:
+        try:
+            if is_calibrating():
+                write_config_status("WAITING_FOR_TUNE")
+            else:
+                cmd_sync_config(drive_dir, remote_dir)
+        except Exception:
+            pass
+        time.sleep(15)
+
+
+def cmd_backup_loop(data_dir: str, drive_dir: str, port: str, remote_dir: str = "") -> int:
     drive_parent = os.path.dirname(drive_dir.rstrip("/"))
     if not os.path.isdir(drive_parent):
         return 0
     os.makedirs(drive_dir, exist_ok=True)
     write_status("IDLE")
     synced_any = False
+    initial_done = False
+    no_space = False
 
     while True:
         time.sleep(12)
-        if not os.path.isdir(data_dir) or is_calibrating():
+        if is_calibrating():
+            write_config_status("WAITING_FOR_TUNE")
             continue
+        if not os.path.isdir(data_dir):
+            if remote_dir:
+                cmd_sync_config(drive_dir, remote_dir)
+            continue
+
         healthy = is_healthy(port)
         pending = []
-        for root, _, files in os.walk(data_dir):
-            rel_root = os.path.relpath(root, data_dir).replace("\\", "/")
-            if rel_root.startswith("conversation-spill"):
-                continue
-            for fn in sorted(files):
-                if fn.endswith(".part") or fn.endswith(".tmp") or fn.endswith(".lock"):
+        if not no_space:
+            for root, _, files in os.walk(data_dir):
+                rel_root = os.path.relpath(root, data_dir).replace("\\", "/")
+                if rel_root.startswith("conversation-spill"):
                     continue
-                full = os.path.join(root, fn)
-                if os.path.exists(full + ".part") or os.path.exists(full + ".tmp"):
-                    continue
-                if fn.endswith(".gguf"):
-                    has_done = os.path.isfile(full + ".done")
-                    is_custom = "/custom/" in full.replace("\\", "/")
-                    if not (has_done or (is_custom and healthy)):
+                for fn in sorted(files):
+                    if fn.endswith(".part") or fn.endswith(".tmp") or fn.endswith(".lock"):
                         continue
-                elif not (rel_root.startswith("packs") or rel_root.startswith("dflash2") or fn.endswith(".done")):
-                    continue
-                rel = os.path.relpath(full, data_dir)
-                dst = os.path.join(drive_dir, rel)
-                size = os.path.getsize(full)
-                if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
-                    pending.append((rel, full, dst, size))
+                    full = os.path.join(root, fn)
+                    if os.path.exists(full + ".part") or os.path.exists(full + ".tmp"):
+                        continue
+                    if fn.endswith(".gguf"):
+                        has_done = os.path.isfile(full + ".done")
+                        is_custom = "/custom/" in full.replace("\\", "/")
+                        if not (has_done or (is_custom and healthy)):
+                            continue
+                    elif not (rel_root.startswith("packs") or rel_root.startswith("dflash2") or fn.endswith(".done")):
+                        continue
+                    rel = os.path.relpath(full, data_dir)
+                    dst = os.path.join(drive_dir, rel)
+                    size = os.path.getsize(full)
+                    if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
+                        pending.append((rel, full, dst, size))
 
-        for rel, full, dst, size in pending:
-            if is_calibrating():
-                break
-            free_bytes = shutil.disk_usage(drive_dir).free
-            if size + (512 * 1024 * 1024) > free_bytes:
-                write_status(f"NO_SPACE:{size / 1e9:.1f}:{free_bytes / 1e9:.1f}")
-                return 0
-            try:
-                copy_with_progress(full, dst, "SSD -> Drive", update_status=True)
-                if os.path.isfile(full + ".done"):
-                    shutil.copy2(full + ".done", dst + ".done")
-                synced_any = True
-            except Exception as e:
-                write_status(f"ERROR:{e}")
+            for rel, full, dst, size in pending:
+                if is_calibrating():
+                    write_config_status("WAITING_FOR_TUNE")
+                    break
+                free_bytes = shutil.disk_usage(drive_dir).free
+                if size + (512 * 1024 * 1024) > free_bytes:
+                    write_status(f"NO_SPACE:{size / 1e9:.1f}:{free_bytes / 1e9:.1f}")
+                    no_space = True
+                    initial_done = True
+                    break
+                try:
+                    copy_with_progress(full, dst, "SSD -> Drive", update_status=True)
+                    if os.path.isfile(full + ".done"):
+                        shutil.copy2(full + ".done", dst + ".done")
+                    synced_any = True
+                except Exception as e:
+                    write_status(f"ERROR:{e}")
 
         if healthy and not pending and not is_calibrating():
-            write_status("DONE" if synced_any else "CACHED")
-            return 0
+            if remote_dir:
+                cmd_sync_config(drive_dir, remote_dir)
+            if not initial_done:
+                write_status("DONE" if synced_any else "CACHED")
+                initial_done = True
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 5 and sys.argv[1] == "restore":
+    cmd = sys.argv[1] if len(sys.argv) >= 2 else ""
+    if cmd == "restore" and len(sys.argv) >= 5:
         sys.exit(cmd_restore(sys.argv[2], sys.argv[3], sys.argv[4]))
-    elif len(sys.argv) >= 5 and sys.argv[1] == "backup":
-        sys.exit(cmd_backup_loop(sys.argv[2], sys.argv[3], sys.argv[4]))
+    if cmd == "restore-config" and len(sys.argv) >= 5:
+        sys.exit(cmd_restore_config(sys.argv[2], sys.argv[3], sys.argv[4], *sys.argv[5:8]))
+    if cmd == "sync-config" and len(sys.argv) >= 4:
+        sys.exit(cmd_sync_config(sys.argv[2], sys.argv[3]))
+    if cmd == "watch-config" and len(sys.argv) >= 4:
+        sys.exit(cmd_watch_config(sys.argv[2], sys.argv[3]))
+    if cmd == "load-profile" and len(sys.argv) >= 4:
+        sys.exit(cmd_load_profile(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) >= 5 else ""))
+    if cmd == "backup" and len(sys.argv) >= 5:
+        sys.exit(cmd_backup_loop(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] if len(sys.argv) >= 6 else ""))
+    if cmd == "gpu-slug":
+        print(detect_gpu_slug())
+        sys.exit(0)
     sys.exit(1)
 PYEOF
 chmod +x "$DRIVE_CACHE_SCRIPT"
 
 pkill -f "[s]trata-drive-cache.py backup" 2>/dev/null || true
-rm -f "$DRIVE_SYNC_STATUS"
+pkill -f "[s]trata-drive-cache.py watch-config" 2>/dev/null || true
+rm -f "$DRIVE_SYNC_STATUS" "$DRIVE_CONFIG_STATUS"
 
 RESTORE_CMD=""
+POST_DRIVE_DIR=""
 if [[ "$USE_DRIVE" == 1 ]]; then
-    RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore $(printf '%q ' "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL") && "
+    RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && $PY $DRIVE_CACHE_SCRIPT restore $(printf '%q ' "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL") && "
+    POST_DRIVE_DIR="$DRIVE_DATA_DIR"
 fi
 
 UI_MODE="${UI_MODE:-desktop}"
@@ -490,7 +995,7 @@ set -uo pipefail
 export PATH=$(printf '%q' "$PY_SHIM_DIR"):/content/.strata-node/bin:\$PATH
 
 if [[ $(printf '%q' "$USE_DRIVE") == 1 && -d $(printf '%q' "$(dirname "$DRIVE_DATA_DIR")") ]]; then
-    $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") backup $(printf '%q ' "$DATA_DIR" "$DRIVE_DATA_DIR" "$REMOTE_PORT") >/content/strata-drive-sync.log 2>&1 &
+    $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") backup $(printf '%q ' "$DATA_DIR" "$DRIVE_DATA_DIR" "$REMOTE_PORT" "$REMOTE_DIR")>/content/strata-drive-sync.log 2>&1 &
 fi
 
 cd $(printf '%q' "$REMOTE_DIR")
@@ -513,25 +1018,7 @@ cd $(printf '%q' "$REMOTE_DIR")
         fi
         sed -i "s|if (path === '/api/health')|if (path === '/api/health' \|\| path === '/health')|g" server/index.mjs
 
-        $(printf '%q' "$PY") - <<'PYCFG'
-import glob, json
-for p in glob.glob('/content/Strata/strata-*.json') + glob.glob('/content/Strata/terminal/strata-*.json'):
-    try:
-        with open(p, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
-        for k in ('args', 'args_written'):
-            arr = cfg.get(k)
-            if isinstance(arr, list):
-                for i in range(len(arr) - 1):
-                    if arr[i] == '--max-context':
-                        arr[i + 1] = '$CONTEXT'
-        cfg['port'] = int('$ENGINE_PORT')
-        cfg['ui_context_chosen'] = True
-        with open(p, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
-PYCFG
+        $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") restore-config $(printf '%q ' "$POST_DRIVE_DIR" "$REMOTE_DIR") post $(printf '%q ' "$CONTEXT" "$ENGINE_PORT" "$UI_MODE")
 
         export STRATA_REAL_ENGINE=1
         export STRATA_PORT=$(printf '%q' "$REMOTE_PORT")
@@ -556,8 +1043,14 @@ PYCFG
                 curl -sf -X POST "http://127.0.0.1:$REMOTE_PORT/api/native/operations" -H 'Content-Type: application/json' \
                     -d "{\"kind\":\"tune\",\"args\":{\"model\":\"\$MODEL_ID\",\"profile\":\"performance\"}}" >/dev/null 2>&1 || true
             else
-                curl -sf -X POST "http://127.0.0.1:$REMOTE_PORT/api/native/operations" -H 'Content-Type: application/json' \
-                    -d "{\"kind\":\"load\",\"args\":{\"model\":\"\$MODEL_ID\"}}" >/dev/null 2>&1 || true
+                LOAD_PROFILE=\$($(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") load-profile $(printf '%q' "$REMOTE_DIR") "\$MODEL_ID" $(printf '%q' "$CONTEXT") 2>/dev/null || true)
+                if [[ -n "\$LOAD_PROFILE" ]]; then
+                    curl -sf -X POST "http://127.0.0.1:$REMOTE_PORT/api/native/operations" -H 'Content-Type: application/json' \
+                        -d "{\"kind\":\"load\",\"args\":{\"model\":\"\$MODEL_ID\",\"resourceProfile\":\"\$LOAD_PROFILE\"}}" >/dev/null 2>&1 || true
+                else
+                    curl -sf -X POST "http://127.0.0.1:$REMOTE_PORT/api/native/operations" -H 'Content-Type: application/json' \
+                        -d "{\"kind\":\"load\",\"args\":{\"model\":\"\$MODEL_ID\"}}" >/dev/null 2>&1 || true
+                fi
             fi
         ) &
 

@@ -13,6 +13,7 @@ Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)*
   - Automatically mounts your Google Drive (`/content/drive/MyDrive/Strata-data`).
   - **Fast Local NVMe Restore**: Restores cached `.gguf` weights, `.done` SHA-256 verification markers, prepared `packs/`, and `dflash2/` drafter files onto the Colab VM's fast local NVMe SSD (`/content/Strata-data`) at Google datacenter transfer speeds — skipping both external Hugging Face downloads and multi-minute SHA-256 re-hashing.
   - **Automatic Background Backup**: Newly downloaded and verified models are backed up to Google Drive in the background (automatically pausing while GPU calibration benchmarks run).
+  - **Automatic Tuned Preset & Config Persistence**: Automatically backs up Strata auto-tune presets (`/root/.config/strata/presets`), serving profiles, and sanitized per-GPU model configs (excluding API keys) to `$DRIVE_DATA_DIR/strata-config/<gpu-model>/` as soon as tuning finishes and on `stop.bat` / `./down.sh`, then restores and applies them automatically on future runs on matching GPUs.
 
 ---
 

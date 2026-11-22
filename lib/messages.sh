@@ -88,6 +88,7 @@ declare -A _MSG_EN=(
 
     # ----- down.sh -----
     [closing_tunnel]="Closing local SSH tunnel..."
+    [down_syncing_config]="Saving tuned Strata presets and configs to Google Drive..."
     [stopping_runtime]="Stopping Colab runtime %s..."
     [runtime_already_gone]="Runtime %s was not found (already stopped)."
     [usage_after_stop]="Account usage status (Active assignments: 0 confirms all VMs are stopped):"
