@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Shared Configuration Loader, SSH Multiplexing, Keepalive & Tunnel Management
+# Shared Configuration Loader, SSH Multiplexing & Tunnel Management
 # ==============================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="$ROOT/.state"
 TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
-KERNEL_KEEPALIVE_PID_FILE="$STATE_DIR/kernel-keepalive.pid"
 mkdir -p "$STATE_DIR"
 
 # Strip CR characters before sourcing so editing config.env on Windows never introduces trailing \r values
@@ -62,26 +61,6 @@ colab_python() {
         [[ -x "$py" ]] && { echo "$py"; return 0; }
     fi
     return 1
-}
-
-start_kernel_keepalive() {
-    local py existing
-    existing="$(cat "$KERNEL_KEEPALIVE_PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
-        return 0
-    fi
-    py="$(colab_python)" || return 0
-    nohup "$py" "$ROOT/lib/colab-helper.py" keepalive "$COLAB_SESSION" >/dev/null 2>&1 &
-    echo "$!" > "$KERNEL_KEEPALIVE_PID_FILE"
-}
-
-stop_kernel_keepalive() {
-    local pid
-    pid="$(cat "$KERNEL_KEEPALIVE_PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-    fi
-    rm -f "$KERNEL_KEEPALIVE_PID_FILE"
 }
 
 # Check whether the Colab session exists on the backend

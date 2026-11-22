@@ -1,6 +1,6 @@
 # Strata Colab Desktop
 
-Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)** (with **256K context**, **1-Click Hardware Auto-Tuning**, **Persistent Google Drive Model Caching**, and local **OpenAI / Anthropic API endpoints**) on a remote **Google Colab GPU** (`G4 RTX PRO 6000 Blackwell`, `H100`, `A100`, `L4`, or `T4`), forwarded seamlessly to **`http://localhost:8080`** on your local machine over SSH.
+Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)** (with **256K context**, **1-Click Hardware Auto-Tuning**, **Persistent Google Drive Model Caching**, and local **OpenAI / Anthropic API endpoints**) on a paid **Google Colab GPU** runtime (`G4 RTX PRO 6000 Blackwell`, `H100`, `A100`, `L4`, or `T4`) for personal interactive research, forwarded strictly to **`http://localhost:8080`** (`127.0.0.1`) on your local machine over the official Google Colab CLI SSH tunnel.
 
 ---
 
@@ -13,14 +13,13 @@ Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)*
   - Automatically mounts your Google Drive (`/content/drive/MyDrive/Strata-data`).
   - **Fast Local NVMe Restore**: Restores cached `.gguf` weights, `.done` SHA-256 verification markers, prepared `packs/`, and `dflash2/` drafter files onto the Colab VM's fast local NVMe SSD (`/content/Strata-data`) at Google datacenter transfer speeds — skipping both external Hugging Face downloads and multi-minute SHA-256 re-hashing.
   - **Automatic Background Backup**: Newly downloaded and verified models are backed up to Google Drive in the background (automatically pausing while GPU calibration benchmarks run).
-- **20-Minute Idle Disconnect Protection**: Runs a lightweight background Jupyter kernel keepalive daemon so Google Colab's 20-minute kernel inactivity watchdog never reclaims the VM during large model downloads or long chat sessions.
 
 ---
 
 ## Requirements
 
 - **Windows 10 / 11** with **Ubuntu on WSL2** (or native Linux / macOS with `bash`)
-- A **Google Account** with Google Colab access (Colab Pro / Pro+ or Compute Units recommended for `G4`, `H100`, `A100`, and `L4` GPUs)
+- A **Google Account** with a **paid Google Colab plan and a positive compute unit balance** (Colab Pro, Colab Pro+, or Pay-As-You-Go) — required by Google Colab's policies for SSH and WebUI workflows and for `G4`, `H100`, `A100`, and `L4` GPUs
 
 ---
 
@@ -100,6 +99,16 @@ All defaults live in [`config.env`](config.env). For private tokens (`HF_TOKEN`,
 | `USE_DRIVE` | `1` | Mount Google Drive to persist and restore models from `DRIVE_DATA_DIR` |
 | `DRIVE_DATA_DIR` | `/content/drive/MyDrive/Strata-data` | Google Drive folder used for persistent model storage |
 | `LOCAL_PORT` | `8080` | Local port on Windows / WSL forwarded to the Colab VM |
+
+---
+
+## Google Colab Terms of Service Compliance
+
+This project is designed for personal interactive research in accordance with the [Google Colab Terms of Service](https://research.google.com/colaboratory/tos_v6.html) and [Google Colab FAQ](https://research.google.com/colaboratory/faq.html):
+
+- **Paid Compute Units Required**: Per the Google Colab FAQ, remote SSH shells and interacting primarily through a WebUI instead of the notebook UI are disallowed on free runtimes without a positive compute unit balance. Maintain a positive paid compute unit balance (Colab Pro, Colab Pro+, or Pay-As-You-Go) when using this project.
+- **Local-Only Personal Research (`127.0.0.1`)**: Port forwarding is bound strictly to `127.0.0.1` via Google's official `google-colab-cli` SSH tunnel for interactive personal research. Do **not** expose endpoints publicly (`0.0.0.0`, ngrok, Cloudflare tunnels, reverse proxies), run a web service offering, or share/resell access to third parties.
+- **No Artificial Idle Bypass**: This project does not run dummy keep-alive loops to circumvent Google Colab idle timeouts, protecting both policy compliance and your compute unit balance. Always run `stop.bat` (`./down.sh`) when finished.
 
 ---
 

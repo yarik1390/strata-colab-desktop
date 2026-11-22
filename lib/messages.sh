@@ -61,7 +61,6 @@ declare -A _MSG_EN=(
     [gpu_not_entitled]="Your account is not entitled to %s or has insufficient quota. Please choose another GPU."
     [model_menu_header]="Choose a Strata model to run (GPU: %s / Context: %s tokens):"
     [model_select_prompt]="Select model by number [Enter=%s]: "
-    [kernel_keepalive_started]="Started background Jupyter kernel keepalive to prevent Colab 20-minute idle disconnects."
     [drive_mounting]="Mounting Google Drive at %s to persist downloaded models..."
     [drive_already_mounted]="Google Drive is mounted (model cache: %s)"
     [drive_mount_failed]="Could not mount Google Drive. Continuing with local VM disk only."

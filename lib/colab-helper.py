@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helper using google-colab-cli's internal client to query eligible GPUs, allocate runtimes, and keep the Jupyter kernel alive."""
+"""Helper using google-colab-cli's internal client to query eligible GPUs and allocate runtimes cleanly."""
 
 import json
 import sys
@@ -17,7 +17,6 @@ from colab_cli.client import (
     resolve_assign_shape,
 )
 from colab_cli.common import state
-from colab_cli.runtime import ColabRuntime
 from colab_cli.state import SessionState
 from colab_cli.utils import get_status_code
 
@@ -236,53 +235,9 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
     return 0
 
 
-def cmd_keepalive(name: str) -> int:
-    """Keep the Colab Jupyter kernel active so Google Colab's 20-minute idle timer never kills the VM."""
-    consecutive_missing = 0
-    while True:
-        try:
-            # Force re-sync with server assignments
-            state._sessions = None
-            s = state.get_session(name, ignore_missing_session=True)
-            if not s:
-                consecutive_missing += 1
-                if consecutive_missing >= 3:
-                    return 0
-                time.sleep(10)
-                continue
-            consecutive_missing = 0
-
-            def on_started(kid):
-                s.kernel_id = kid
-                state.store.add(s)
-
-            def on_sess_started(sid):
-                s.session_id = sid
-                state.store.add(s)
-
-            rt = ColabRuntime(
-                s.url,
-                s.token,
-                session_name=name,
-                kernel_id=s.kernel_id,
-                session_id=s.session_id,
-                on_kernel_started=on_started,
-                on_session_started=on_sess_started,
-            )
-            try:
-                rt.execute_code(
-                    "import time\nfor _ in range(10):\n    print('keepalive', flush=True)\n    time.sleep(30)\n",
-                    timeout=90.0,
-                )
-            finally:
-                rt.stop()
-        except Exception:
-            time.sleep(15)
-
-
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Usage: colab-helper.py <info|adopt|assign|keepalive> ...", file=sys.stderr)
+        print("Usage: colab-helper.py <info|adopt|assign> ...", file=sys.stderr)
         return 1
     cmd = sys.argv[1]
     if cmd == "info":
@@ -291,8 +246,6 @@ def main() -> int:
         return cmd_adopt_existing(sys.argv[2])
     if cmd == "assign":
         return cmd_assign(sys.argv[2], sys.argv[3], sys.argv[4])
-    if cmd == "keepalive":
-        return cmd_keepalive(sys.argv[2])
     return 1
 
 

@@ -6,8 +6,6 @@ source "$(dirname "$0")/lib/common.sh"
 
 require_cmds colab
 
-stop_kernel_keepalive
-
 if [[ -f "$TUNNEL_PID_FILE" ]]; then
     log "$(msg closing_tunnel)"
     stop_tunnel

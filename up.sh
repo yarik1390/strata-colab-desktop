@@ -66,7 +66,6 @@ select_and_create_runtime() {
                 EXPECT_GPU_REGEX="$(expect_gpu_regex_for "$s_gpu")"
                 return 0
             fi
-            stop_kernel_keepalive
             log "$(msg stopping_runtime "$COLAB_SESSION")"
             stop_master
             colab stop -s "$COLAB_SESSION" || true
@@ -159,7 +158,6 @@ ensure_drive_mounted() {
         log "$(msg drive_already_mounted "$DRIVE_DATA_DIR")"
         return 0
     fi
-    stop_kernel_keepalive
     log "$(msg drive_mounting "$DRIVE_MOUNT")"
     if ! colab drivemount -s "$COLAB_SESSION" "$DRIVE_MOUNT"; then
         warn "$(msg drive_mount_failed)"
@@ -252,7 +250,6 @@ check_gpu() {
     esac
     [[ "$ans" =~ ^[yY] ]] && return 0
 
-    stop_kernel_keepalive
     log "$(msg stopping_to_save)"
     stop_master
     colab stop -s "$COLAB_SESSION" || true
@@ -276,23 +273,19 @@ main() {
     # 3. Mount Google Drive for persistent model caching & fast restore
     ensure_drive_mounted
 
-    # 4. Start background Jupyter kernel keepalive to prevent 20-min idle timeouts
-    start_kernel_keepalive
-    log "$(msg kernel_keepalive_started)"
-
-    # 5. Select Strata model matched to GPU memory and Drive cache status
+    # 4. Select Strata model matched to GPU memory and Drive cache status
     select_model
 
-    # 6. Provision and start Strata (Desktop UI or CLI server) inside tmux on the VM
+    # 5. Provision and start Strata (Desktop UI or CLI server) inside tmux on the VM
     log "$(msg preparing)"
     remote_start 0
 
-    # 7. Wait for Strata to become healthy
+    # 6. Wait for Strata to become healthy
     log "$(msg waiting_start)"
     wait_healthy
     log "$(msg started)"
 
-    # 8. Open local SSH port-forwarding tunnel and launch browser
+    # 7. Open local SSH port-forwarding tunnel and launch browser
     run_tunnel_foreground
 }
 
