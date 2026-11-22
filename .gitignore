@@ -1,0 +1,10 @@
+.state/
+__pycache__/
+*.py[cod]
+config.local.env
+.env.local
+*.key
+*.pem
+*.token
+*.log
+docs/

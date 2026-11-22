@@ -1,0 +1,31 @@
+# ==============================================================================
+# OpenSSH Client Configuration for Google Colab Runtime Tunneling
+# ==============================================================================
+# All scripts invoke `ssh -F ./ssh_config colab-strata` so your personal
+# ~/.ssh/config is never modified or read.
+#
+# Note: Use `./ssh.sh` to open a shell on the VM rather than calling `ssh`
+# directly, as `colab ssh` will allocate a new runtime if none is active.
+
+Host colab-strata
+    # Bridge SSH over the Colab CLI WebSocket proxy using the generated Ed25519 key
+    ProxyCommand colab ssh --proxy-mode -s $COLAB_SESSION -i ~/.ssh/id_ed25519
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    HostName colab-vm
+    User root
+
+    # Ephemeral Colab VMs generate a new host key on every allocation
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+    ConnectTimeout 60
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+
+    # Multiplex all SSH commands and port forwards over a single shared connection,
+    # since a Colab runtime accepts only one concurrent SSH WebSocket session.
+    ControlMaster auto
+    ControlPath ~/.ssh/colab-cm-${COLAB_SESSION}
+    ControlPersist 2m
