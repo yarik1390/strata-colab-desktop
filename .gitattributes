@@ -3,4 +3,5 @@
 *.env      text eol=lf
 ssh_config text eol=lf
 *.md       text eol=lf
+*.ipynb    text eol=lf
 *.bat      text eol=crlf

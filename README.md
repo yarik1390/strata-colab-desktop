@@ -1,5 +1,7 @@
 # Strata Colab Desktop
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yarik1390/strata-colab-desktop/blob/main/notebooks/Strata_Colab_Quickstart.ipynb)
+
 Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)** (with **256K context**, **1-Click Hardware Auto-Tuning**, **Persistent Google Drive Model Caching**, and local **OpenAI / Anthropic API endpoints**) on a paid **Google Colab GPU** runtime (`G4 RTX PRO 6000 Blackwell`, `H100`, `A100`, `L4`, or `T4`) for personal interactive research, forwarded strictly to **`http://localhost:8080`** (`127.0.0.1`) on your local machine over the official Google Colab CLI SSH tunnel.
 
 ---
@@ -61,6 +63,13 @@ On Windows, double-click **`start.bat`** (or run `./up.sh` inside WSL):
        5) Qwen3.8-Flash    [IQ3_S]       (~84 GB download, 50.0 GB RAM, best for G4/A100/H100) [default]
    ```
 4. **Chat, Code & Tune**: Once ready, your browser opens **`http://localhost:8080`** to the full **Strata Desktop App**.
+
+### Option B: Run Directly in Google Colab (No WSL Required)
+
+Prefer running directly inside a Colab notebook (for example from any browser or mobile device)? Open **[`notebooks/Strata_Colab_Quickstart.ipynb`](notebooks/Strata_Colab_Quickstart.ipynb)** via **[Open in Colab](https://colab.research.google.com/github/yarik1390/strata-colab-desktop/blob/main/notebooks/Strata_Colab_Quickstart.ipynb)**:
+
+- Automatically detects your Colab GPU (`G4`, `H100`, `A100`, `L4`, or `T4`), selects an appropriate Strata model (`Auto (match GPU)` or manual preset), and verifies CUDA/OpenAI API inference + streaming benchmarks (live-tested on Colab).
+- Shares the exact same `/content/drive/MyDrive/Strata-data` Google Drive model cache as `start.bat` / `./up.sh`.
 
 ---
 
