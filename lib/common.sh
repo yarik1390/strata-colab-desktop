@@ -11,6 +11,13 @@ WORKLOAD_PID_FILE="$STATE_DIR/workload-monitor.pid"
 WORKLOAD_LOG_FILE="$STATE_DIR/workload-monitor.log"
 mkdir -p "$STATE_DIR"
 
+declare -A _CALLER_ENV=()
+for _k in GPU ASK_GPU MODEL ASK_MODEL MODEL_FAMILY CONTEXT UI_MODE OPEN_BROWSER; do
+    if [[ -n "${!_k:-}" ]]; then
+        _CALLER_ENV["$_k"]="${!_k}"
+    fi
+done
+
 # Strip CR characters before sourcing so editing config.env on Windows never introduces trailing \r values
 # shellcheck disable=SC1090
 load_config() { source <(tr -d '\r' < "$1"); }
@@ -18,6 +25,10 @@ load_config "$ROOT/config.env"
 if [[ -f "$ROOT/config.local.env" ]]; then
     load_config "$ROOT/config.local.env"
 fi
+for _k in "${!_CALLER_ENV[@]}"; do
+    printf -v "$_k" '%s' "${_CALLER_ENV[$_k]}"
+done
+unset _CALLER_ENV _k
 # shellcheck source=messages.sh
 source "$ROOT/lib/messages.sh"
 
