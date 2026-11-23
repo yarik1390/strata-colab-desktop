@@ -11,6 +11,7 @@ if [[ -f "$TUNNEL_PID_FILE" ]]; then
     stop_tunnel
 fi
 close_link
+stop_workload_monitor
 
 # Adopt any orphaned server-side assignment before stopping
 if py="$(colab_python 2>/dev/null)"; then

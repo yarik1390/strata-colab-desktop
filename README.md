@@ -69,6 +69,7 @@ On Windows, double-click **`start.bat`** (or run `./up.sh` inside WSL):
 | Action | Windows | WSL / Linux |
 |---|---|---|
 | **Start runtime, mount Drive & open Strata Desktop** | `start.bat` | `./up.sh` |
+| **Run or monitor Auto-Tune via active `colab exec`** | `tune.bat` | `./tune.sh` |
 | **Restart Strata after editing `config.env` (keeps VM & models)** | `restart.bat` | `./restart.sh` |
 | **Stop runtime & stop compute unit billing** | `stop.bat` | `./down.sh` |
 | **Check runtime, GPU, Drive cache & tunnel status** | `status.bat` | `./status.sh` |
@@ -100,6 +101,7 @@ All defaults live in [`config.env`](config.env). For private tokens (`HF_TOKEN`,
 | `USE_DRIVE` | `1` | Mount Google Drive to persist and restore models from `DRIVE_DATA_DIR` |
 | `DRIVE_DATA_DIR` | `/content/drive/MyDrive/Strata-data` | Google Drive folder used for persistent model storage |
 | `LOCAL_PORT` | `8080` | Local port on Windows / WSL forwarded to the Colab VM |
+| `ACTIVE_WORKLOAD_MONITOR` | `1` | Report active tuning/GPU/setup progress via `colab exec` (exits automatically when idle) |
 
 ---
 
@@ -109,7 +111,7 @@ This project is designed for personal interactive research in accordance with th
 
 - **Paid Compute Units Required**: Per the Google Colab FAQ, remote SSH shells and interacting primarily through a WebUI instead of the notebook UI are disallowed on free runtimes without a positive compute unit balance. Maintain a positive paid compute unit balance (Colab Pro, Colab Pro+, or Pay-As-You-Go) when using this project.
 - **Local-Only Personal Research (`127.0.0.1`)**: Port forwarding is bound strictly to `127.0.0.1` via Google's official `google-colab-cli` SSH tunnel for interactive personal research. Do **not** expose endpoints publicly (`0.0.0.0`, ngrok, Cloudflare tunnels, reverse proxies), run a web service offering, or share/resell access to third parties.
-- **No Artificial Idle Bypass**: This project does not run dummy keep-alive loops to circumvent Google Colab idle timeouts, protecting both policy compliance and your compute unit balance. Always run `stop.bat` (`./down.sh`) when finished.
+- **Active-Workload Kernel Reporting (`colab exec`)**: This project never runs dummy idle keepalive loops. Instead, while real GPU/tuning/setup work is active, it streams genuine progress and telemetry through Google Colab's official `colab exec` channel (or `./tune.sh` / `tune.bat`) and releases the kernel immediately when the VM becomes idle. Always run `stop.bat` (`./down.sh`) when finished.
 
 ---
 

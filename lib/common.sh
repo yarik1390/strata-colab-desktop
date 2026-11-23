@@ -7,6 +7,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE_DIR="$ROOT/.state"
 TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
+WORKLOAD_PID_FILE="$STATE_DIR/workload-monitor.pid"
+WORKLOAD_LOG_FILE="$STATE_DIR/workload-monitor.log"
 mkdir -p "$STATE_DIR"
 
 # Strip CR characters before sourcing so editing config.env on Windows never introduces trailing \r values
@@ -30,6 +32,7 @@ DRIVE_MOUNT="${DRIVE_MOUNT:-/content/drive}"
 DRIVE_DATA_DIR="${DRIVE_DATA_DIR:-/content/drive/MyDrive/Strata-data}"
 UI_MODE="${UI_MODE:-desktop}"
 TUNE_ON_START="${TUNE_ON_START:-0}"
+ACTIVE_WORKLOAD_MONITOR="${ACTIVE_WORKLOAD_MONITOR:-1}"
 
 export COLAB_SESSION
 command -v colab >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
@@ -166,6 +169,7 @@ wait_healthy() {
             *) if [[ -n "${status//[[:space:]]/}" ]]; then printf '    %s\n' "${status:0:160}"; fi ;;
         esac
         (( SECONDS < deadline )) || die "$(msg start_timeout "$HEALTH_TIMEOUT_MIN")"
+        maybe_run_workload_monitor || true
         sleep "$POLL_SEC"
     done
 }
@@ -186,6 +190,97 @@ wait_ssh() {
         sleep 10
     done
     die "$(msg ssh_failed)"
+}
+
+# ----- Active-Workload Colab Kernel Telemetry Monitor -----
+_WORKLOAD_LOGGED_ACTIVE=0
+
+workload_monitor_running() {
+    local pid
+    pid="$(cat "$WORKLOAD_PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+stop_workload_monitor() {
+    local pid
+    pid="$(cat "$WORKLOAD_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$WORKLOAD_PID_FILE"
+    _WORKLOAD_LOGGED_ACTIVE=0
+}
+
+remote_workload_active() {
+    rssh "python3 -" <<'PY' 2>/dev/null
+import os, subprocess, sys
+markers = (
+    "calibrate_config",
+    "strata.py\x00tune",
+    "strata.py\x00presets\x00recheck",
+    "strata.py\x00calibrate",
+    "native-tune/tune-",
+    "setup.sh\x00",
+    "strata-drive-cache.py\x00restore",
+    "npm\x00ci",
+    "npm\x00run\x00build",
+    "hf\x00download",
+)
+ignored = (
+    "colab-workload.py",
+    "strata-drive-cache.py\x00backup",
+    "strata-drive-cache.py\x00watch-config",
+)
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        cmd = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", errors="ignore")
+    except OSError:
+        continue
+    if not cmd or any(x in cmd for x in ignored):
+        continue
+    if any(m in cmd for m in markers):
+        sys.exit(0)
+try:
+    with open("/tmp/strata-drive-sync.status", "r", encoding="utf-8") as f:
+        if f.readline().strip().startswith("SYNCING:"):
+            sys.exit(0)
+except OSError:
+    pass
+try:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+        stderr=subprocess.DEVNULL, text=True, timeout=5,
+    )
+    for line in out.splitlines():
+        line = line.strip()
+        if line and int(float(line)) >= 5:
+            sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
+}
+
+maybe_run_workload_monitor() {
+    [[ "${ACTIVE_WORKLOAD_MONITOR:-1}" == 1 ]] || return 0
+    workload_monitor_running && return 0
+    if remote_workload_active; then
+        if (( _WORKLOAD_LOGGED_ACTIVE == 0 )); then
+            log "$(msg workload_monitor_started)"
+            _WORKLOAD_LOGGED_ACTIVE=1
+        fi
+        colab exec -s "$COLAB_SESSION" --timeout 90 -f "$ROOT/lib/colab-workload.py" \
+            </dev/null >>"$WORKLOAD_LOG_FILE" 2>&1 &
+        echo "$!" > "$WORKLOAD_PID_FILE"
+    else
+        if (( _WORKLOAD_LOGGED_ACTIVE == 1 )); then
+            log "$(msg workload_monitor_idle)"
+            _WORKLOAD_LOGGED_ACTIVE=0
+        fi
+    fi
+    return 0
 }
 
 # ----- Shared SSH Port-Forwarding Tunnel -----
@@ -258,7 +353,7 @@ run_tunnel_foreground() {
     fi
 
     echo "$$" > "$TUNNEL_PID_FILE"
-    trap 'close_link; rm -f "$TUNNEL_PID_FILE"; echo; warn "$(msg tunnel_closed)"' EXIT
+    trap 'stop_workload_monitor; close_link; rm -f "$TUNNEL_PID_FILE"; echo; warn "$(msg tunnel_closed)"' EXIT
     trap 'exit 130' INT TERM
 
     open_link || die "$(msg tunnel_failed)"
@@ -301,6 +396,7 @@ watch_strata() {
                     ;;
             esac
         fi
+        maybe_run_workload_monitor || true
         sleep "$WATCH_SEC"
         if local_healthy; then
             fails=0

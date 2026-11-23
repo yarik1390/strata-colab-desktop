@@ -36,5 +36,13 @@ fi
 msg st_tunnel "$LOCAL_PORT"; echo
 if local_healthy; then echo "    $(msg st_connected)"; else echo "    $(msg st_disconnected)"; fi
 
+msg st_workload; echo
+if workload_monitor_running; then
+    last_wl="$(tail -n 1 "$WORKLOAD_LOG_FILE" 2>/dev/null || true)"
+    echo "    Active (streaming via colab exec)${last_wl:+: $last_wl}"
+else
+    echo "    Idle (no kernel monitor running)"
+fi
+
 msg st_units; echo
 colab usage | sed 's/^/    /'

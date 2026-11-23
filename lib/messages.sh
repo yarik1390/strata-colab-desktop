@@ -39,6 +39,8 @@ declare -A _MSG_EN=(
     [relink_retry_later]="Could not reopen the tunnel. Will retry on the next watchdog check."
     [strata_down_recovering]="Strata on Colab is unresponsive. Attempting automatic recovery..."
     [recovered]="Strata has recovered."
+    [workload_monitor_started]="Active compute workload detected on Colab VM; streaming telemetry via official 'colab exec' (stops automatically when idle)."
+    [workload_monitor_idle]="Colab VM compute workload is now idle; Colab kernel monitor released."
 
     # ----- Endpoints Display -----
     [ep_webui]="Strata Desktop / WebUI : %s"
@@ -93,6 +95,12 @@ declare -A _MSG_EN=(
     [runtime_already_gone]="Runtime %s was not found (already stopped)."
     [usage_after_stop]="Account usage status (Active assignments: 0 confirms all VMs are stopped):"
 
+    # ----- tune.sh -----
+    [tune_starting]="Starting Strata Auto-Tune (%s / %s / %s) on Colab VM..."
+    [tune_already_running]="Active Strata tuning job detected on Colab VM; attaching via official 'colab exec'..."
+    [tune_finished]="Strata tuning finished! Syncing saved presets and configs to Google Drive..."
+    [tune_failed_start]="Could not start Strata Auto-Tune automatically. Start it in Strata Desktop UI (http://localhost:%s) and re-run ./tune.sh to monitor via colab exec."
+
     # ----- status.sh -----
     [st_runtime]="== Colab Runtime: %s =="
     [st_vm]="== Colab VM Hardware & Disk =="
@@ -102,6 +110,7 @@ declare -A _MSG_EN=(
     [st_drive]="== Google Drive Model Cache: %s =="
     [st_none]="No active runtime"
     [st_tunnel]="== Local SSH Tunnel: http://localhost:%s =="
+    [st_workload]="== Active-Workload Kernel Monitor =="
     [st_connected]="Connected"
     [st_disconnected]="Not connected"
     [st_units]="== Compute Units =="
