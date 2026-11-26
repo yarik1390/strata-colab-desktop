@@ -63,6 +63,7 @@ PY
 if remote_tuning_active; then
     log "$(msg tune_already_running)"
 elif remote_healthy; then
+    detect_active_remote_model
     MODEL_ID="$(tr '[:upper:]' '[:lower:]' <<<"$MODEL")"
     if [[ -n "${MODEL_FAMILY:-}" && "${MODEL_FAMILY,,}" != "qwen" ]]; then
         MODEL_ID="$(tr '[:upper:]' '[:lower:]' <<<"$MODEL_FAMILY")-$MODEL_ID"

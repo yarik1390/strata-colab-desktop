@@ -120,21 +120,46 @@ def cmd_adopt_existing(name: str) -> int:
 SINGLE_SHAPE_GPUS = {Accelerator.G4, Accelerator.H100, Accelerator.L4}
 
 
-def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
-    """Attempt to allocate a single GPU runtime without long retry loops or raw tracebacks.
+def _shape_label(shape: object) -> str:
+    """Return a readable shape name even when resolve_assign_shape returns None (STANDARD)."""
+    return Shape.HIGH_RAM.name if shape == Shape.HIGH_RAM else Shape.STANDARD.name
 
-    Exit codes:
-      0 - Allocated and saved to session store
-      2 - No capacity available right now (503 / 502 / 504 / 412 / timeout)
-      3 - Account not eligible / quota rejected (400)
-      1 - Other error
-    """
-    accelerator = Accelerator(gpu_str.upper())
-    variant = Variant.GPU
-    high_mem = (high_mem_str == "1") and (accelerator not in SINGLE_SHAPE_GPUS)
-    shape = resolve_assign_shape(accelerator, high_mem=high_mem)
 
-    # Check if an active server assignment already exists (e.g., created via Colab MCP or browser)
+def _format_error(e: Exception) -> str:
+    """Format an API or transport exception into a concise, token-free diagnostic line."""
+    status = get_status_code(e) if isinstance(e, ColabRequestError) else None
+    detail = " ".join(str(e).split())
+    if len(detail) > 160:
+        detail = detail[:157] + "..."
+    if status is not None:
+        return f"HTTP {status} ({type(e).__name__}): {detail}"
+    return f"{type(e).__name__}: {detail}"
+
+
+def _extract_proxy_fields(res: object) -> tuple[str, str, str, object]:
+    """Extract (endpoint, token, url, expires_at) from an assignment response."""
+    if isinstance(res, PostAssignmentResponse):
+        return (
+            res.endpoint,
+            res.runtime_proxy_info.token,
+            res.runtime_proxy_info.url,
+            res.runtime_proxy_info.expires_at(),
+        )
+    has_proxy = hasattr(res, "runtime_proxy_info")
+    return (
+        res.endpoint,
+        res.runtime_proxy_info.token
+        if has_proxy
+        else getattr(res, "runtime_proxy_token", ""),
+        res.runtime_proxy_info.url if has_proxy else "",
+        res.runtime_proxy_info.expires_at() if has_proxy else None,
+    )
+
+
+def _adopt_matching_assignment(
+    name: str, accelerator: Accelerator
+) -> tuple[bool, str]:
+    """Adopt an active server-side assignment matching accelerator if one already exists."""
     _, existing_assignments = state.sync_sessions()
     for a in existing_assignments:
         if a.accelerator == accelerator:
@@ -148,14 +173,23 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
                 accelerator=a.accelerator.value,
                 machine_shape=a.machine_shape.name,
             )
-            return 0
+            return True, a.machine_shape.name
+    return False, ""
 
+
+def _assign_single_shape(name: str, accelerator: Accelerator, shape: Shape) -> int:
+    """Attempt one GPU + Shape allocation with fast failure on pool exhaustion.
+
+    Only waits and retries once when a 502/503/504/Timeout occurred after >=20s
+    (characteristic of cold-booting VMs past Colab's 30s HTTP proxy cutoff).
+    Fast capacity refusals (412 or <20s 503) return code 2 immediately.
+    """
+    variant = Variant.GPU
     nbh = uuid.uuid4()
-
-    # Cold-booting A100/G4 VMs often takes 40-45s, while Colab's HTTP proxy cuts off POST /tun/m/assign at 30s with 503.
-    # Doing 1 retry with the SAME notebook_hash (nbh) after 8s claims the VM once it finishes booting.
     res = None
+
     for attempt in range(2):
+        t0 = time.monotonic()
         try:
             assignment = state.client._get_assignment(
                 nbh, variant=variant, accelerator=accelerator, shape=shape
@@ -171,11 +205,26 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
                 shape=shape,
             )
             break
-        except TooManyAssignmentsError:
+        except TooManyAssignmentsError as e:
+            print(
+                f"[colab] {accelerator.value} ({_shape_label(shape)}): {_format_error(e)}",
+                file=sys.stderr,
+            )
             return 2
         except Exception as e:
+            elapsed = time.monotonic() - t0
             status = get_status_code(e) if isinstance(e, ColabRequestError) else None
+            print(
+                f"[colab] {accelerator.value} ({_shape_label(shape)}) failed in {elapsed:.1f}s: {_format_error(e)}",
+                file=sys.stderr,
+            )
+            if status == 412:
+                return 2
+            if status == 400:
+                return 3
             if status in (502, 503, 504) or "Timeout" in type(e).__name__:
+                if elapsed < 20.0:
+                    return 2
                 time.sleep(8)
                 try:
                     check = state.client._get_assignment(
@@ -186,42 +235,19 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
                         break
                 except Exception:
                     pass
+                adopted, _ = _adopt_matching_assignment(name, accelerator)
+                if adopted:
+                    return 0
                 if attempt == 0:
                     continue
                 return 2
-            elif status == 412:
-                return 2
-            elif status == 400:
-                return 3
-            else:
-                print(f"[colab] Error: {e}", file=sys.stderr)
-                return 1
+            return 1
 
     if res is None:
         return 2
 
-    if isinstance(res, PostAssignmentResponse):
-        token = res.runtime_proxy_info.token
-        url = res.runtime_proxy_info.url
-        endpoint = res.endpoint
-        expires_at = res.runtime_proxy_info.expires_at()
-    else:
-        token = (
-            res.runtime_proxy_info.token
-            if hasattr(res, "runtime_proxy_info")
-            else getattr(res, "runtime_proxy_token", "")
-        )
-        url = res.runtime_proxy_info.url if hasattr(res, "runtime_proxy_info") else ""
-        endpoint = res.endpoint
-        expires_at = (
-            res.runtime_proxy_info.expires_at()
-            if hasattr(res, "runtime_proxy_info")
-            else None
-        )
-
-    machine_shape = (
-        Shape.HIGH_RAM.name if shape == Shape.HIGH_RAM else Shape.STANDARD.name
-    )
+    endpoint, token, url, expires_at = _extract_proxy_fields(res)
+    machine_shape = _shape_label(shape)
     _save_session(
         name=name,
         endpoint=endpoint,
@@ -235,9 +261,103 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
     return 0
 
 
+def _assign_gpu_with_fallback(
+    name: str, gpu_str: str, high_mem_str: str
+) -> tuple[int, str]:
+    """Assign a GPU, falling back from HIGH_RAM to STANDARD shape when supported."""
+    try:
+        accelerator = Accelerator(gpu_str.upper())
+    except ValueError as e:
+        print(f"[colab] Invalid GPU {gpu_str!r}: {e}", file=sys.stderr)
+        return 1, ""
+
+    adopted, adopted_shape = _adopt_matching_assignment(name, accelerator)
+    if adopted:
+        return 0, adopted_shape
+
+    high_mem = (high_mem_str == "1") and (accelerator not in SINGLE_SHAPE_GPUS)
+    primary = resolve_assign_shape(accelerator, high_mem=high_mem)
+    fallback = resolve_assign_shape(accelerator, high_mem=False)
+    shapes = [primary] if primary == fallback else [primary, fallback]
+
+    for idx, shape in enumerate(shapes):
+        if idx > 0:
+            print(
+                f"[colab] {accelerator.value} {_shape_label(shapes[idx - 1])} unavailable; falling back to {_shape_label(shape)} shape...",
+                file=sys.stderr,
+            )
+        rc = _assign_single_shape(name, accelerator, shape)
+        if rc == 0:
+            return 0, _shape_label(shape)
+        if rc in (1, 3):
+            return rc, ""
+
+    return 2, ""
+
+
+def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
+    """Attempt to allocate a single GPU runtime (with HIGH_RAM -> STANDARD fallback).
+
+    Exit codes:
+      0 - Allocated and saved to session store
+      2 - No capacity available right now (503 / 502 / 504 / 412 / timeout)
+      3 - Account not eligible / quota rejected (400)
+      1 - Other error
+    """
+    rc, _ = _assign_gpu_with_fallback(name, gpu_str, high_mem_str)
+    return rc
+
+
+def cmd_auto_assign(name: str, gpus_csv: str, high_mem_str: str) -> int:
+    """Try candidate GPUs in preference order until one succeeds.
+
+    Prints ASSIGNED_GPU=<GPU>:<SHAPE> to stdout on success.
+    """
+    gpus = [
+        g.strip().upper()
+        for g in gpus_csv.replace(" ", ",").split(",")
+        if g.strip()
+    ]
+    if not gpus:
+        gpus = ["G4", "H100", "A100", "L4", "T4"]
+
+    # Prefer adopting an already-active assignment matching any candidate in priority order.
+    for gpu_str in gpus:
+        try:
+            acc = Accelerator(gpu_str)
+        except ValueError:
+            continue
+        adopted, adopted_shape = _adopt_matching_assignment(name, acc)
+        if adopted:
+            print(f"ASSIGNED_GPU={gpu_str}:{adopted_shape}")
+            return 0
+
+    saw_nocap = False
+    saw_not_entitled = False
+    for gpu_str in gpus:
+        print(f"[colab] Trying {gpu_str}...", file=sys.stderr)
+        rc, chosen_shape = _assign_gpu_with_fallback(name, gpu_str, high_mem_str)
+        if rc == 0:
+            print(f"ASSIGNED_GPU={gpu_str}:{chosen_shape}")
+            return 0
+        if rc == 2:
+            saw_nocap = True
+        elif rc == 3:
+            saw_not_entitled = True
+
+    if saw_nocap:
+        return 2
+    if saw_not_entitled:
+        return 3
+    return 1
+
+
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Usage: colab-helper.py <info|adopt|assign> ...", file=sys.stderr)
+        print(
+            "Usage: colab-helper.py <info|adopt|assign|auto-assign> ...",
+            file=sys.stderr,
+        )
         return 1
     cmd = sys.argv[1]
     if cmd == "info":
@@ -246,6 +366,8 @@ def main() -> int:
         return cmd_adopt_existing(sys.argv[2])
     if cmd == "assign":
         return cmd_assign(sys.argv[2], sys.argv[3], sys.argv[4])
+    if cmd == "auto-assign":
+        return cmd_auto_assign(sys.argv[2], sys.argv[3], sys.argv[4])
     return 1
 
 

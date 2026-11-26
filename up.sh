@@ -76,13 +76,17 @@ select_and_create_runtime() {
         fi
     fi
 
-    # 2. Allocate a new runtime (with interactive GPU selector & 503 capacity fallback)
+    # 2. Allocate a new runtime (with AUTO waterfall, interactive GPU selector & capacity fallback)
     local -A no_cap=()
     local need_prompt="${ASK_GPU:-1}"
-    local default_gpu="$GPU"
+    local default_gpu="${GPU^^}"
+    local all_label="" _g
+    for _g in "${ELIGIBLE_GPUS[@]}"; do
+        all_label+="${all_label:+ -> }$_g"
+    done
 
     while true; do
-        if [[ -n "${no_cap[$default_gpu]:-}" ]]; then
+        if [[ "$default_gpu" != "AUTO" && -n "${no_cap[$default_gpu]:-}" ]]; then
             local g
             for g in "${ELIGIBLE_GPUS[@]}"; do
                 if [[ -z "${no_cap[$g]:-}" ]]; then
@@ -95,6 +99,9 @@ select_and_create_runtime() {
         if [[ "$need_prompt" == 1 && -t 0 ]]; then
             echo
             log "$(msg gpu_menu_header)"
+            local auto_tag=""
+            [[ "$default_gpu" == "AUTO" ]] && auto_tag="$(msg gpu_menu_default_tag)"
+            printf "    0) AUTO  (%s)%s\n" "$(msg gpu_menu_auto_option "$all_label")" "$auto_tag"
             local idx=1 g tag desc
             for g in "${ELIGIBLE_GPUS[@]}"; do
                 desc="$(gpu_spec_desc "$g")"
@@ -113,6 +120,8 @@ select_and_create_runtime() {
             choice="${choice//[[:space:]]/}"
             if [[ -z "$choice" ]]; then
                 GPU="$default_gpu"
+            elif [[ "$choice" == "0" || "${choice^^}" == "AUTO" ]]; then
+                GPU="AUTO"
             elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ELIGIBLE_GPUS[@]} )); then
                 GPU="${ELIGIBLE_GPUS[$((choice - 1))]}"
             else
@@ -123,6 +132,40 @@ select_and_create_runtime() {
         fi
 
         stop_master
+
+        if [[ "$GPU" == "AUTO" ]]; then
+            local -a candidates=()
+            local g
+            for g in "${ELIGIBLE_GPUS[@]}"; do
+                [[ -z "${no_cap[$g]:-}" ]] && candidates+=("$g")
+            done
+            if (( ${#candidates[@]} == 0 )); then
+                no_cap=()
+                candidates=("${ELIGIBLE_GPUS[@]}")
+            fi
+            local candidates_csv
+            candidates_csv="$(IFS=,; echo "${candidates[*]}")"
+            log "$(msg gpu_auto_starting "$candidates_csv")"
+
+            local assign_out="" rc=0
+            assign_out="$("$py" "$ROOT/lib/colab-helper.py" auto-assign "$COLAB_SESSION" "$candidates_csv" "${HIGH_MEM:-0}")" || rc=$?
+            if (( rc == 0 )); then
+                local assigned_line="${assign_out##*ASSIGNED_GPU=}"
+                assigned_line="${assigned_line%%$'\n'*}"
+                local assigned_gpu="${assigned_line%%:*}"
+                local assigned_shape="${assigned_line#*:}"
+                [[ -n "$assigned_gpu" ]] && GPU="$assigned_gpu"
+                log "$(msg gpu_auto_selected "$GPU" "${assigned_shape:-STANDARD}")"
+                EXPECT_GPU_REGEX="$(expect_gpu_regex_for "$GPU")"
+                return 0
+            fi
+            warn "$(msg gpu_auto_all_failed "$candidates_csv")"
+            for g in "${candidates[@]}"; do no_cap[$g]=1; done
+            need_prompt=1
+            [[ -t 0 ]] || die "$(msg gpu_aborted)"
+            continue
+        fi
+
         local hm_flag=""
         if [[ "$HIGH_MEM" == 1 && "$GPU" != "G4" && "$GPU" != "H100" && "$GPU" != "L4" ]]; then
             hm_flag=" --high-mem"
@@ -166,14 +209,16 @@ ensure_drive_mounted() {
 }
 
 select_model() {
-    [[ -z "$MODEL_REPO" && "${ASK_MODEL:-1}" == 1 && -t 0 ]] || return 0
+    [[ -z "$MODEL_REPO" ]] || return 0
 
-    local def_num=2
-    case "$GPU" in
-        G4|A100|H100) def_num=5 ;;
-        L4)           def_num=2 ;;
-        T4)           def_num=1 ;;
-    esac
+    if [[ "${ASK_MODEL:-1}" != 1 || ! -t 0 ]]; then
+        resolve_auto_model "$GPU"
+        return 0
+    fi
+
+    probe_vm_memory_gb
+    local def_num
+    def_num="$(recommended_model_slot "$GPU")"
 
     # Detect models already cached in Google Drive
     local drive_files=""

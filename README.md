@@ -77,7 +77,9 @@ Prefer running directly inside a Colab notebook (for example from any browser or
 
 | Action | Windows | WSL / Linux |
 |---|---|---|
-| **Start runtime, mount Drive & open Strata Desktop** | `start.bat` | `./up.sh` |
+| **Open the Strata Colab Desktop Launcher UI** | `launcher.bat` | — |
+| **Create the Windows Desktop shortcut with custom icon** | `create-shortcut.bat` | — |
+| **Start runtime, mount Drive & open Strata Desktop (CLI)** | `start.bat` | `./up.sh` |
 | **Run or monitor Auto-Tune via active `colab exec`** | `tune.bat` | `./tune.sh` |
 | **Restart Strata after editing `config.env` (keeps VM & models)** | `restart.bat` | `./restart.sh` |
 | **Stop runtime & stop compute unit billing** | `stop.bat` | `./down.sh` |
@@ -85,6 +87,14 @@ Prefer running directly inside a Colab notebook (for example from any browser or
 | **Stream live remote logs** | | `./logs.sh` |
 | **Open an interactive SSH shell on the Colab VM** | | `./ssh.sh` |
 | **Reconnect the local SSH tunnel to a running VM** | | `./tunnel.sh` |
+
+### Windows Desktop Launcher (`launcher.bat` & Desktop Shortcut)
+
+Double-click **`launcher.bat`** (or run **`create-shortcut.bat`** once to add a **`Strata Colab Desktop`** shortcut to your Windows Desktop) to open the native WPF control panel:
+
+- **One-Click Auto GPU Fallback (`GPU=AUTO`)**: Tries eligible Colab GPUs in priority order (`G4 -> H100 -> A100 -> L4 -> T4`), falls back automatically from `HIGH_RAM` to `STANDARD` shapes (`A100 80GB -> A100 40GB`, `T4 High-RAM -> T4`), and fails fast on `412` / regional pool exhaustion without hanging in long retry loops.
+- **Auto Model Selection (`MODEL=AUTO`)**: Inspects the allocated VM's actual GPU VRAM and system RAM and automatically selects `IQ3_S` (`A100`/`H100`/`G4`), `IQ2_XS` (`L4`), or `qwen36` `UD-Q4_K_XL` (`T4`).
+- **Live Status & Safe Shutdown**: Shows real-time GPU runtime, Strata engine health, local tunnel (`http://localhost:8080`), Compute Unit balance, live streamed logs, and prompts before exiting so you can stop the Colab VM (`./down.sh`) cleanly without accidental billing.
 
 ### Local Endpoints (while tunnel is active)
 
@@ -100,10 +110,11 @@ All defaults live in [`config.env`](config.env). For private tokens (`HF_TOKEN`,
 
 | Variable | Default | Description |
 |---|---|---|
-| `GPU` | `G4` | Preferred default GPU (`G4`, `H100`, `A100`, `L4`, `T4`) |
-| `ASK_GPU` | `1` | Prompt to select an eligible GPU at startup and auto-fallback on `503` capacity shortages |
+| `GPU` | `AUTO` | `AUTO` (try best available `G4 -> H100 -> A100 -> L4 -> T4`), or explicit GPU (`G4`, `H100`, `A100`, `L4`, `T4`) |
+| `ASK_GPU` | `1` | Prompt to select an eligible GPU at startup (supports `0) AUTO`) with `HIGH_RAM -> STANDARD` and pool-capacity fallback (`412`/`503`) |
+| `HIGH_MEM` | `1` | Request High-RAM shape when supported (`A100`, `T4`), with automatic fallback to `STANDARD` shape if High-RAM pool is full |
 | `UI_MODE` | `desktop` | `desktop` = full Strata Desktop UI (`app/host`); `cli` = headless Strata CLI server |
-| `MODEL` | `IQ3_S` | Default model quantization (`IQ3_S`, `IQ2_XS`, `Q2_0`, `IQ1_M`, `UD-Q4_K_XL`, etc.) |
+| `MODEL` | `AUTO` | `AUTO` (matched to allocated VM VRAM/RAM), or explicit size (`IQ3_S`, `IQ2_XS`, `Q2_0`, `IQ1_M`, `UD-Q4_K_XL`, etc.) |
 | `ASK_MODEL` | `1` | Prompt to select a model matched to your GPU RAM and Google Drive cache |
 | `CONTEXT` | `262144` | Context window size in tokens (`262144` = 256K tokens) |
 | `TUNE_ON_START` | `0` | Set to `1` to automatically run Strata hardware calibration/tuning before loading |

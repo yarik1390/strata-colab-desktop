@@ -12,7 +12,7 @@ WORKLOAD_LOG_FILE="$STATE_DIR/workload-monitor.log"
 mkdir -p "$STATE_DIR"
 
 declare -A _CALLER_ENV=()
-for _k in GPU ASK_GPU MODEL ASK_MODEL MODEL_FAMILY CONTEXT UI_MODE OPEN_BROWSER; do
+for _k in GPU ASK_GPU HIGH_MEM MODEL ASK_MODEL MODEL_FAMILY CONTEXT TUNE_ON_START USE_DRIVE LOCAL_PORT ACTIVE_WORKLOAD_MONITOR UI_MODE OPEN_BROWSER; do
     if [[ -n "${!_k:-}" ]]; then
         _CALLER_ENV["$_k"]="${!_k}"
     fi
@@ -122,10 +122,99 @@ remote_healthy() {
 EXIT_MARK='[strata-colab-cli] setup.sh exited'
 PORT_ERR_RE='already in use|address in use|eaddrinuse'
 
+VM_VRAM_GB=0
+VM_RAM_GB=0
+VM_GPU_NAME=""
+
+# Query live VRAM, system RAM, and GPU name on the active Colab VM
+probe_vm_memory_gb() {
+    local out vram_mib ram_mib gname
+    out="$(rssh "nvidia-smi --query-gpu=memory.total,name --format=csv,noheader,nounits 2>/dev/null | head -n1; free -m | awk '/^Mem:/ {print \$2}'" 2>/dev/null || true)"
+    local line1 line2
+    line1="$(sed -n '1p' <<<"$out")"
+    line2="$(sed -n '2p' <<<"$out")"
+    vram_mib="$(cut -d',' -f1 <<<"$line1" | tr -dc '0-9')"
+    gname="$(cut -d',' -f2- <<<"$line1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    ram_mib="$(tr -dc '0-9' <<<"$line2")"
+    vram_mib="${vram_mib:-0}"
+    ram_mib="${ram_mib:-0}"
+    VM_VRAM_GB=$(( (vram_mib + 512) / 1024 ))
+    VM_RAM_GB=$(( (ram_mib + 512) / 1024 ))
+    VM_GPU_NAME="${gname:-}"
+}
+
+# Return default menu slot (5=IQ3_S, 2=IQ2_XS, 1=qwen36/UD-Q4_K_XL) for the VM
+recommended_model_slot() {
+    local gpu_hint="${1:-${GPU:-}}"
+    if (( VM_VRAM_GB >= 40 && VM_RAM_GB >= 80 )); then
+        echo 5
+    elif (( VM_VRAM_GB >= 22 && VM_RAM_GB >= 48 )); then
+        echo 2
+    elif (( VM_VRAM_GB > 0 )); then
+        echo 1
+    else
+        case "${gpu_hint^^}" in
+            G4|A100|H100) echo 5 ;;
+            L4)           echo 2 ;;
+            *)            echo 1 ;;
+        esac
+    fi
+}
+
+# Resolve MODEL=AUTO using the live VM's VRAM and RAM (or GPU hint)
+resolve_auto_model() {
+    [[ -z "$MODEL_REPO" && "${MODEL^^}" == "AUTO" ]] || return 0
+    probe_vm_memory_gb
+    local slot
+    slot="$(recommended_model_slot "${1:-${GPU:-}}")"
+    case "$slot" in
+        5) MODEL_FAMILY="";       MODEL="IQ3_S" ;;
+        2) MODEL_FAMILY="";       MODEL="IQ2_XS" ;;
+        *) MODEL_FAMILY="qwen36"; MODEL="UD-Q4_K_XL" ;;
+    esac
+    local gpu_label="${VM_GPU_NAME:-${GPU:-Colab GPU}}"
+    log "$(msg model_auto_selected "$MODEL" "${MODEL_FAMILY:-qwen3.8-flash}" "$gpu_label" "${VM_VRAM_GB:-0}" "${VM_RAM_GB:-0}")"
+}
+
+# Detect the active Strata model/family running on the VM, falling back to resolve_auto_model
+detect_active_remote_model() {
+    [[ "${MODEL^^}" == "AUTO" ]] || return 0
+    local detected=""
+    detected="$(rssh "python3 -" <<'PY' 2>/dev/null || true
+import os
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        args = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", errors="ignore").split("\x00")
+    except OSError:
+        continue
+    if not any("strata.py" in a or "setup.sh" in a for a in args):
+        continue
+    model = ""
+    family = ""
+    for i, a in enumerate(args):
+        if a == "--model" and i + 1 < len(args):
+            model = args[i + 1]
+        elif a == "--family" and i + 1 < len(args):
+            family = args[i + 1]
+    if model and model.upper() != "AUTO":
+        print(f"{model}\t{family}")
+        break
+PY
+)"
+    if [[ -n "$detected" ]]; then
+        IFS=$'\t' read -r MODEL MODEL_FAMILY <<<"$detected"
+    else
+        resolve_auto_model "${GPU:-}"
+    fi
+}
+
 # Launch or restart Strata on the Colab VM inside tmux.
 # Secrets (API_KEY, HF_TOKEN) are piped via stdin rather than passed on the command line.
 remote_start() {
     local FORCE_RESTART="${1:-0}"
+    resolve_auto_model "${GPU:-}"
     {
         printf 'API_KEY=%q\nHF_TOKEN=%q\n' "$API_KEY" "$HF_TOKEN"
         cat "$ROOT/lib/messages.sh" "$ROOT/lib/remote-setup.sh"
