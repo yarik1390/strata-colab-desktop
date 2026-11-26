@@ -202,7 +202,14 @@ ensure_drive_mounted() {
         return 0
     fi
     log "$(msg drive_mounting "$DRIVE_MOUNT")"
-    if ! colab drivemount -s "$COLAB_SESSION" "$DRIVE_MOUNT"; then
+    local dm_rc=0
+    if [[ ! -t 0 ]] && command -v setsid >/dev/null 2>&1; then
+        # Detach controlling TTY so colab drivemount reads Enter from piped stdin when hosted by the UI.
+        setsid -w colab drivemount -s "$COLAB_SESSION" "$DRIVE_MOUNT" || dm_rc=$?
+    else
+        colab drivemount -s "$COLAB_SESSION" "$DRIVE_MOUNT" || dm_rc=$?
+    fi
+    if (( dm_rc != 0 )); then
         warn "$(msg drive_mount_failed)"
         USE_DRIVE=0
     fi

@@ -12,7 +12,7 @@ WORKLOAD_LOG_FILE="$STATE_DIR/workload-monitor.log"
 mkdir -p "$STATE_DIR"
 
 declare -A _CALLER_ENV=()
-for _k in GPU ASK_GPU HIGH_MEM MODEL ASK_MODEL MODEL_FAMILY CONTEXT TUNE_ON_START USE_DRIVE LOCAL_PORT ACTIVE_WORKLOAD_MONITOR UI_MODE OPEN_BROWSER; do
+for _k in GPU ASK_GPU HIGH_MEM MODEL ASK_MODEL MODEL_FAMILY CONTEXT TUNE_ON_START USE_DRIVE LOCAL_PORT ACTIVE_WORKLOAD_MONITOR UI_MODE OPEN_BROWSER STRATA_UI_HOST; do
     if [[ -n "${!_k:-}" ]]; then
         _CALLER_ENV["$_k"]="${!_k}"
     fi
@@ -47,6 +47,9 @@ ACTIVE_WORKLOAD_MONITOR="${ACTIVE_WORKLOAD_MONITOR:-1}"
 
 export COLAB_SESSION
 command -v colab >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
+if [[ -z "${BROWSER:-}" && -x "$ROOT/lib/wsl-open-url.sh" ]] && command -v powershell.exe >/dev/null 2>&1; then
+    export BROWSER="$ROOT/lib/wsl-open-url.sh"
+fi
 
 SSH_HOST="${SSH_HOST:-colab-strata}"
 SSH_OPTS=(-F "$ROOT/ssh_config")

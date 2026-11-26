@@ -50,6 +50,10 @@ public sealed class StrataProcessSlot {
     public int LastExitCode { get { return _lastExitCode; } }
 
     public bool Start(string fileName, string arguments, string workingDir) {
+        return Start(fileName, arguments, workingDir, false);
+    }
+
+    public bool Start(string fileName, string arguments, string workingDir, bool keepStdinOpen) {
         lock (_lock) {
             if (_running) return false;
             string discard;
@@ -84,10 +88,25 @@ public sealed class StrataProcessSlot {
             _proc = p;
             _running = true;
             p.Start();
-            try { p.StandardInput.Close(); } catch { }
+            if (!keepStdinOpen) {
+                try { p.StandardInput.Close(); } catch { }
+            }
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
             return true;
+        }
+    }
+
+    public bool SendLine(string text) {
+        lock (_lock) {
+            if (_proc == null || !_running) return false;
+            try {
+                _proc.StandardInput.WriteLine(text ?? "");
+                _proc.StandardInput.Flush();
+                return true;
+            } catch {
+                return false;
+            }
         }
     }
 
@@ -460,6 +479,7 @@ function Build-WslArgs {
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
@@ -610,8 +630,28 @@ function Build-WslArgs {
             </StackPanel>
         </Grid>
 
+        <!-- Drive OAuth Banner (shown only when Google Drive authorization is needed) -->
+        <Border x:Name="AuthBanner" Grid.Row="4" Visibility="Collapsed"
+                Background="#1F160A" BorderBrush="#F59E0B" BorderThickness="1"
+                CornerRadius="8" Padding="12,10" Margin="0,0,0,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Google Drive authorization opened in your browser. Click Allow in Google, then click Continue."
+                           Foreground="#FDE68A" FontSize="12.5" FontWeight="SemiBold"
+                           VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,12,0"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="BtnAuthContinue" Content="I've Granted Access — Continue" Style="{StaticResource PrimaryBtn}" Padding="12,6" FontSize="12" Margin="0,0,8,0"/>
+                    <Button x:Name="BtnAuthOpen" Content="Open Auth Page" Style="{StaticResource ActionBtn}" Padding="10,6" FontSize="12" Margin="0,0,6,0"/>
+                    <Button x:Name="BtnAuthCopy" Content="Copy URL" Style="{StaticResource ActionBtn}" Padding="10,6" FontSize="12"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
         <!-- Console Output -->
-        <Border Grid.Row="4" Background="#070B14" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="10" Padding="8">
+        <Border Grid.Row="5" Background="#070B14" BorderBrush="{StaticResource CardBorder}" BorderThickness="1" CornerRadius="10" Padding="8">
             <TextBox x:Name="TxtLog"
                      Background="Transparent"
                      Foreground="#E2E8F0"
@@ -666,6 +706,10 @@ $BtnTune = $window.FindName('BtnTune')
 $BtnRestart = $window.FindName('BtnRestart')
 $BtnDetach = $window.FindName('BtnDetach')
 $BtnStopVm = $window.FindName('BtnStopVm')
+$AuthBanner = $window.FindName('AuthBanner')
+$BtnAuthContinue = $window.FindName('BtnAuthContinue')
+$BtnAuthOpen = $window.FindName('BtnAuthOpen')
+$BtnAuthCopy = $window.FindName('BtnAuthCopy')
 $BtnCopyLog = $window.FindName('BtnCopyLog')
 $BtnClearLog = $window.FindName('BtnClearLog')
 $TxtLog = $window.FindName('TxtLog')
@@ -763,6 +807,7 @@ $script:StatusBuffer = New-Object System.Collections.Generic.List[string]
 $script:ActiveMode = ''
 $script:HasActiveRuntime = $false
 $script:ForceClosing = $false
+$script:PendingAuthUrl = ''
 
 function Append-Log {
     param([string]$Line)
@@ -911,10 +956,13 @@ function Start-SessionTask {
     $sel = Get-UiSelection
     Write-LocalConfigOverrides -Overrides $sel
     $script:ActiveMode = 'starting'
+    $script:PendingAuthUrl = ''
+    $AuthBanner.Visibility = 'Collapsed'
     Set-Badge $Label '#38BDF8'
     Append-Log "=== $Label ($ScriptName) ==="
 
     $envPrefix = @(
+        'STRATA_UI_HOST=1',
         'ASK_GPU=0',
         'ASK_MODEL=0',
         "GPU=$($sel.GPU)",
@@ -930,7 +978,7 @@ function Start-SessionTask {
     ) -join ' '
 
     $bashCmd = "env $envPrefix bash ./$ScriptName"
-    if ($script:SessionSlot.Start('wsl.exe', (Build-WslArgs $bashCmd), $RepoRoot)) {
+    if ($script:SessionSlot.Start('wsl.exe', (Build-WslArgs $bashCmd), $RepoRoot, $true)) {
         Update-ButtonStates
     } else {
         Append-Log '[UI] Another primary task is still running.'
@@ -984,10 +1032,12 @@ $BtnTune.Add_Click({
 })
 
 $BtnDetach.Add_Click({
+    $AuthBanner.Visibility = 'Collapsed'
+    $script:PendingAuthUrl = ''
     if ($script:SessionSlot.IsRunning) {
         Append-Log '[UI] Detaching local WSL tunnel / task process...'
         $script:SessionSlot.StopTree()
-        $null = Start-Process -FilePath 'wsl.exe' -ArgumentList (Build-WslArgs 'source ./lib/common.sh; stop_tunnel || true') -WindowStyle Hidden
+        $null = Start-Process -FilePath 'wsl.exe' -ArgumentList (Build-WslArgs "pkill -TERM -f 'colab drivemount -s' 2>/dev/null || true; source ./lib/common.sh; stop_tunnel || true") -WindowStyle Hidden
     }
     if ($script:AuxSlot.IsRunning) {
         $script:AuxSlot.StopTree()
@@ -998,6 +1048,8 @@ $BtnDetach.Add_Click({
 })
 
 $BtnStopVm.Add_Click({
+    $AuthBanner.Visibility = 'Collapsed'
+    $script:PendingAuthUrl = ''
     if ($script:SessionSlot.IsRunning) {
         $script:SessionSlot.StopTree()
         Start-Sleep -Milliseconds 300
@@ -1009,8 +1061,30 @@ $BtnStopVm.Add_Click({
     $script:ActiveMode = 'stopping'
     Set-Badge 'Stopping VM...' '#F59E0B'
     Append-Log '=== Stopping Colab VM & Closing Tunnel (./down.sh) ==='
-    if ($script:SessionSlot.Start('wsl.exe', (Build-WslArgs 'bash ./down.sh'), $RepoRoot)) {
+    if ($script:SessionSlot.Start('wsl.exe', (Build-WslArgs "pkill -TERM -f 'colab drivemount -s' 2>/dev/null || true; bash ./down.sh"), $RepoRoot)) {
         Update-ButtonStates
+    }
+})
+
+$BtnAuthContinue.Add_Click({
+    if ($script:SessionSlot.SendLine('')) {
+        Append-Log '[UI] Sent Enter to continue Google Drive mount...'
+        $AuthBanner.Visibility = 'Collapsed'
+        Set-Badge 'Authorizing Drive...' '#38BDF8'
+    } else {
+        Append-Log '[UI] Could not send Enter to session process.'
+    }
+})
+
+$BtnAuthOpen.Add_Click({
+    if ($script:PendingAuthUrl) {
+        try { [System.Diagnostics.Process]::Start($script:PendingAuthUrl) | Out-Null } catch { }
+    }
+})
+
+$BtnAuthCopy.Add_Click({
+    if ($script:PendingAuthUrl) {
+        try { [System.Windows.Clipboard]::SetText($script:PendingAuthUrl) } catch { }
     }
 })
 
@@ -1034,6 +1108,8 @@ $timer.Add_Tick({
             $code = $item.Substring(5)
             $wasMode = $script:ActiveMode
             $script:ActiveMode = ''
+            $AuthBanner.Visibility = 'Collapsed'
+            $script:PendingAuthUrl = ''
             Append-Log "[Process exited with code $code]"
             if ($code -eq '0') {
                 Set-Badge 'Ready' '#22C55E'
@@ -1045,8 +1121,19 @@ $timer.Add_Tick({
         } else {
             $text = $item.Substring(4)
             Append-Log $text
-            if ($text -match 'Local tunnel active|Press Ctrl\+C to stop|SSH tunnel running|is running') {
+            if ($text -match '^(https://accounts\.google\.com/o/oauth2/\S+)') {
+                $script:PendingAuthUrl = $Matches[1]
+                $AuthBanner.Visibility = 'Visible'
+                Set-Badge 'Authorize Drive' '#F59E0B'
+                try { [System.Diagnostics.Process]::Start($script:PendingAuthUrl) | Out-Null } catch { }
+                Append-Log '[UI] Opened Google Drive authorization page in your Windows browser. After granting access, click "I''ve Granted Access - Continue".'
+            } elseif ($text -match 'Credentials propagated|Mounted at|Google Drive already mounted') {
+                $AuthBanner.Visibility = 'Collapsed'
+                $script:PendingAuthUrl = ''
+            } elseif ($text -match 'Local tunnel active|Press Ctrl\+C to stop|SSH tunnel running|is running') {
                 $script:ActiveMode = 'tunnel'
+                $AuthBanner.Visibility = 'Collapsed'
+                $script:PendingAuthUrl = ''
                 Set-Badge 'Tunnel Active' '#22C55E'
                 Update-ButtonStates
                 Trigger-StatusRefresh
