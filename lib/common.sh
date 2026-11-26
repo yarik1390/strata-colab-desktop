@@ -12,7 +12,7 @@ WORKLOAD_LOG_FILE="$STATE_DIR/workload-monitor.log"
 mkdir -p "$STATE_DIR"
 
 declare -A _CALLER_ENV=()
-for _k in GPU ASK_GPU HIGH_MEM MODEL ASK_MODEL MODEL_FAMILY CONTEXT TUNE_ON_START USE_DRIVE LOCAL_PORT ACTIVE_WORKLOAD_MONITOR UI_MODE OPEN_BROWSER STRATA_UI_HOST; do
+for _k in GPU ASK_GPU HIGH_MEM MODEL ASK_MODEL MODEL_FAMILY CONTEXT TUNE_ON_START USE_DRIVE DRIVE_MODEL_CACHE LOCAL_PORT ACTIVE_WORKLOAD_MONITOR UI_MODE OPEN_BROWSER STRATA_UI_HOST; do
     if [[ -n "${!_k:-}" ]]; then
         _CALLER_ENV["$_k"]="${!_k}"
     fi
@@ -39,6 +39,7 @@ MODEL_REPO="${MODEL_REPO:-}"
 MODEL_FILES="${MODEL_FILES:-}"
 MODEL_REVISION="${MODEL_REVISION:-}"
 USE_DRIVE="${USE_DRIVE:-1}"
+DRIVE_MODEL_CACHE="${DRIVE_MODEL_CACHE:-0}"
 DRIVE_MOUNT="${DRIVE_MOUNT:-/content/drive}"
 DRIVE_DATA_DIR="${DRIVE_DATA_DIR:-/content/drive/MyDrive/Strata-data}"
 UI_MODE="${UI_MODE:-desktop}"
@@ -222,7 +223,7 @@ remote_start() {
         printf 'API_KEY=%q\nHF_TOKEN=%q\n' "$API_KEY" "$HF_TOKEN"
         cat "$ROOT/lib/messages.sh" "$ROOT/lib/remote-setup.sh"
     } | rssh "$(remote_env STRATA_REPO REMOTE_DIR DATA_DIR MODEL CONTEXT REMOTE_PORT STRATA_EXTRA_ARGS REMOTE_LOG \
-                MODEL_FAMILY MODEL_REPO MODEL_FILES MODEL_REVISION USE_DRIVE DRIVE_DATA_DIR UI_MODE TUNE_ON_START FORCE_RESTART MSG_LANG) bash -s"
+                MODEL_FAMILY MODEL_REPO MODEL_FILES MODEL_REVISION USE_DRIVE DRIVE_MODEL_CACHE DRIVE_DATA_DIR UI_MODE TUNE_ON_START FORCE_RESTART MSG_LANG) bash -s"
 }
 
 # Poll the remote VM state in a single SSH call: HEALTHY / PORT_IN_USE / EXITED / NOT_RUNNING / last log line
@@ -477,7 +478,7 @@ run_tunnel_foreground() {
 # Watchdog loop: monitors tunnel health, reports Google Drive backup progress, and auto-recovers dropped tunnels
 watch_strata() {
     local fails=0 drive_done=0 dstat=""
-    [[ "$USE_DRIVE" == 1 ]] || drive_done=1
+    [[ "$USE_DRIVE" == 1 && "$DRIVE_MODEL_CACHE" == 1 ]] || drive_done=1
     while true; do
         if (( drive_done == 0 )); then
             dstat="$(rssh "cat /tmp/strata-drive-sync.status 2>/dev/null" 2>/dev/null || true)"

@@ -599,7 +599,8 @@ function Build-WslArgs {
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <CheckBox x:Name="ChkDrive" Content="Mount Google Drive cache" Style="{StaticResource DarkCheck}" Margin="0,0,18,0"/>
+                        <CheckBox x:Name="ChkDrive" Content="Mount Google Drive (presets &amp; configs)" Style="{StaticResource DarkCheck}" Margin="0,0,18,0"/>
+                        <CheckBox x:Name="ChkDriveModelCache" Content="Cache GGUF models in Drive (slower than HF)" Style="{StaticResource DarkCheck}" Margin="0,0,18,0"/>
                         <CheckBox x:Name="ChkHighMem" Content="High-RAM shape (auto-fallback to Standard)" Style="{StaticResource DarkCheck}" Margin="0,0,18,0"/>
                         <CheckBox x:Name="ChkMonitor" Content="Anti-idle kernel monitor" Style="{StaticResource DarkCheck}" Margin="0,0,18,0"/>
                         <CheckBox x:Name="ChkBrowser" Content="Open browser on ready" Style="{StaticResource DarkCheck}"/>
@@ -696,6 +697,7 @@ $CmbContext = $window.FindName('CmbContext')
 $CmbUiMode = $window.FindName('CmbUiMode')
 $CmbTune = $window.FindName('CmbTune')
 $ChkDrive = $window.FindName('ChkDrive')
+$ChkDriveModelCache = $window.FindName('ChkDriveModelCache')
 $ChkHighMem = $window.FindName('ChkHighMem')
 $ChkMonitor = $window.FindName('ChkMonitor')
 $ChkBrowser = $window.FindName('ChkBrowser')
@@ -786,6 +788,7 @@ $cfgTune = if ($cfg['TUNE_ON_START']) { $cfg['TUNE_ON_START'].Trim() } else { '0
 $CmbTune.SelectedIndex = if ($cfgTune -eq '1') { 1 } else { 0 }
 
 $ChkDrive.IsChecked = ($cfg['USE_DRIVE'] -ne '0')
+$ChkDriveModelCache.IsChecked = ($cfg['DRIVE_MODEL_CACHE'] -eq '1')
 $ChkHighMem.IsChecked = ($cfg['HIGH_MEM'] -ne '0')
 $ChkMonitor.IsChecked = ($cfg['ACTIVE_WORKLOAD_MONITOR'] -ne '0')
 $ChkBrowser.IsChecked = ($cfg['OPEN_BROWSER'] -ne '0')
@@ -838,6 +841,7 @@ function Get-UiSelection {
         UI_MODE = $uiVal
         TUNE_ON_START = $tuneVal
         USE_DRIVE = if ($ChkDrive.IsChecked) { '1' } else { '0' }
+        DRIVE_MODEL_CACHE = if ($ChkDriveModelCache.IsChecked) { '1' } else { '0' }
         HIGH_MEM = if ($ChkHighMem.IsChecked) { '1' } else { '0' }
         ACTIVE_WORKLOAD_MONITOR = if ($ChkMonitor.IsChecked) { '1' } else { '0' }
         OPEN_BROWSER = if ($ChkBrowser.IsChecked) { '1' } else { '0' }
@@ -972,6 +976,7 @@ function Start-SessionTask {
         "UI_MODE=$($sel.UI_MODE)",
         "TUNE_ON_START=$($sel.TUNE_ON_START)",
         "USE_DRIVE=$($sel.USE_DRIVE)",
+        "DRIVE_MODEL_CACHE=$($sel.DRIVE_MODEL_CACHE)",
         "HIGH_MEM=$($sel.HIGH_MEM)",
         "ACTIVE_WORKLOAD_MONITOR=$($sel.ACTIVE_WORKLOAD_MONITOR)",
         "OPEN_BROWSER=$($sel.OPEN_BROWSER)"

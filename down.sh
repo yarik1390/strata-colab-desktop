@@ -21,18 +21,20 @@ fi
 if session_exists; then
     # If a Google Drive model backup is currently in flight, wait for completion (Ctrl+C skips waiting)
     if [[ "${USE_DRIVE:-1}" == 1 ]]; then
-        while true; do
-            dstat="$(rssh "cat /tmp/strata-drive-sync.status 2>/dev/null" 2>/dev/null || true)"
-            case "$dstat" in
-                SYNCING:*)
-                    log "$(msg down_waiting_drive_sync "${dstat#SYNCING:}")"
-                    sleep 5 || break
-                    ;;
-                *)
-                    break
-                    ;;
-            esac
-        done
+        if [[ "${DRIVE_MODEL_CACHE:-0}" == 1 ]]; then
+            while true; do
+                dstat="$(rssh "cat /tmp/strata-drive-sync.status 2>/dev/null" 2>/dev/null || true)"
+                case "$dstat" in
+                    SYNCING:*)
+                        log "$(msg down_waiting_drive_sync "${dstat#SYNCING:}")"
+                        sleep 5 || break
+                        ;;
+                    *)
+                        break
+                        ;;
+                esac
+            done
+        fi
         log "$(msg down_syncing_config)"
         rssh "if [[ -f /tmp/strata-drive-cache.py ]]; then python3 /tmp/strata-drive-cache.py sync-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") || true; fi" 2>/dev/null || true
     fi

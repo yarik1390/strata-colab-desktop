@@ -261,6 +261,7 @@ fi
 
 # ----- Google Drive Persistent Cache & Fast Local SSD Restore -----
 USE_DRIVE="${USE_DRIVE:-1}"
+DRIVE_MODEL_CACHE="${DRIVE_MODEL_CACHE:-0}"
 DRIVE_DATA_DIR="${DRIVE_DATA_DIR:-/content/drive/MyDrive/Strata-data}"
 DRIVE_CACHE_SCRIPT="/tmp/strata-drive-cache.py"
 DRIVE_SYNC_STATUS="/tmp/strata-drive-sync.status"
@@ -268,6 +269,7 @@ DRIVE_CONFIG_STATUS="/tmp/strata-config-sync.status"
 
 cat > "$DRIVE_CACHE_SCRIPT" <<'PYEOF'
 #!/usr/bin/env python3
+import concurrent.futures
 import glob
 import json
 import os
@@ -275,6 +277,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -377,29 +380,102 @@ def matches_model(rel_path: str, model: str) -> bool:
     return any(k in base for k in SHARED_KEYWORDS)
 
 
-def copy_with_progress(src: str, dst: str, label: str, update_status: bool = False) -> None:
+def copy_with_progress(
+    src: str, dst: str, label: str, update_status: bool = False, parallel_read: bool = False
+) -> None:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     total = os.path.getsize(src)
     tmp = dst + ".tmp"
     copied = 0
     last_print = 0.0
-    with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
-        while True:
-            buf = fsrc.read(16 * 1024 * 1024)
-            if not buf:
-                break
-            fdst.write(buf)
-            copied += len(buf)
-            now = time.time()
-            if now - last_print >= 2.5 and total > 0:
-                last_print = now
-                pct = int(copied * 100 // total)
-                msg = f"{os.path.basename(dst)}: {copied / 1e9:.2f} / {total / 1e9:.2f} GB ({pct}%)"
-                print(f"  [{label}] {msg}", flush=True)
-                if update_status:
-                    write_status(f"SYNCING:{msg}")
-        fdst.flush()
-        os.fsync(fdst.fileno())
+    start_t = time.time()
+    lock = threading.Lock()
+
+    def report(copied_bytes: int) -> None:
+        nonlocal last_print
+        now = time.time()
+        if now - last_print >= 2.5 and total > 0:
+            last_print = now
+            elapsed = max(0.001, now - start_t)
+            rate_mb = copied_bytes / 1e6 / elapsed
+            pct = int(copied_bytes * 100 // total)
+            msg = f"{os.path.basename(dst)}: {copied_bytes / 1e9:.2f} / {total / 1e9:.2f} GB ({pct}%, {rate_mb:.0f} MB/s)"
+            print(f"  [{label}] {msg}", flush=True)
+            if update_status:
+                write_status(f"SYNCING:{msg}")
+
+    done_parallel = False
+    if parallel_read and total >= 64 * 1024 * 1024 and hasattr(os, "pread") and hasattr(os, "pwrite"):
+        src_fd = -1
+        dst_fd = -1
+        try:
+            src_fd = os.open(src, os.O_RDONLY)
+            dst_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.ftruncate(dst_fd, total)
+            chunk_size = 16 * 1024 * 1024
+            ranges = [
+                (off, min(chunk_size, total - off))
+                for off in range(0, total, chunk_size)
+            ]
+
+            def copy_range(offset: int, length: int) -> None:
+                nonlocal copied
+                pos = offset
+                rem = length
+                while rem > 0:
+                    buf = os.pread(src_fd, min(4 * 1024 * 1024, rem), pos)
+                    if not buf:
+                        raise EOFError(f"Unexpected EOF reading {src} at {pos}")
+                    w_off = 0
+                    while w_off < len(buf):
+                        n = os.pwrite(dst_fd, buf[w_off:], pos + w_off)
+                        if n <= 0:
+                            raise OSError(f"Short pwrite to {tmp} at {pos + w_off}")
+                        w_off += n
+                    pos += len(buf)
+                    rem -= len(buf)
+                    with lock:
+                        copied += len(buf)
+                        report(copied)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(copy_range, off, length) for off, length in ranges]
+                for fut in futures:
+                    fut.result()
+
+            os.fsync(dst_fd)
+            done_parallel = True
+        except OSError:
+            copied = 0
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        finally:
+            if src_fd >= 0:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
+            if dst_fd >= 0:
+                try:
+                    os.close(dst_fd)
+                except OSError:
+                    pass
+
+    if not done_parallel:
+        with open(src, "rb") as fsrc, open(tmp, "wb") as fdst:
+            while True:
+                buf = fsrc.read(16 * 1024 * 1024)
+                if not buf:
+                    break
+                fdst.write(buf)
+                copied += len(buf)
+                report(copied)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+
     os.replace(tmp, dst)
     try:
         shutil.copystat(src, dst)
@@ -813,7 +889,7 @@ def cmd_restore(drive_dir: str, data_dir: str, model: str) -> int:
         size = os.path.getsize(src)
         if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
             print(f"[remote] Restoring from Google Drive: {rel} ({size / 1e9:.2f} GB)", flush=True)
-            copy_with_progress(src, dst, "Drive -> SSD", update_status=False)
+            copy_with_progress(src, dst, "Drive -> SSD", update_status=False, parallel_read=True)
             restored_files += 1
             restored_bytes += size
         if os.path.isfile(src_done) and not os.path.isfile(dst_done):
@@ -969,7 +1045,11 @@ rm -f "$DRIVE_SYNC_STATUS" "$DRIVE_CONFIG_STATUS"
 RESTORE_CMD=""
 POST_DRIVE_DIR=""
 if [[ "$USE_DRIVE" == 1 ]]; then
-    RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && $PY $DRIVE_CACHE_SCRIPT restore $(printf '%q ' "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL") && "
+    if [[ "${DRIVE_MODEL_CACHE:-0}" == 1 ]]; then
+        RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && $PY $DRIVE_CACHE_SCRIPT restore $(printf '%q ' "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL") && "
+    else
+        RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && echo '[remote] Google Drive config sync enabled (DRIVE_MODEL_CACHE=0: downloading GGUF directly from Hugging Face).' && "
+    fi
     POST_DRIVE_DIR="$DRIVE_DATA_DIR"
 fi
 
@@ -995,7 +1075,11 @@ set -uo pipefail
 export PATH=$(printf '%q' "$PY_SHIM_DIR"):/content/.strata-node/bin:\$PATH
 
 if [[ $(printf '%q' "$USE_DRIVE") == 1 && -d $(printf '%q' "$(dirname "$DRIVE_DATA_DIR")") ]]; then
-    $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") backup $(printf '%q ' "$DATA_DIR" "$DRIVE_DATA_DIR" "$REMOTE_PORT" "$REMOTE_DIR")>/content/strata-drive-sync.log 2>&1 &
+    if [[ $(printf '%q' "$DRIVE_MODEL_CACHE") == 1 ]]; then
+        $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") backup $(printf '%q ' "$DATA_DIR" "$DRIVE_DATA_DIR" "$REMOTE_PORT" "$REMOTE_DIR")>/content/strata-drive-sync.log 2>&1 &
+    else
+        $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") watch-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR")>/content/strata-config-sync.log 2>&1 &
+    fi
 fi
 
 cd $(printf '%q' "$REMOTE_DIR")

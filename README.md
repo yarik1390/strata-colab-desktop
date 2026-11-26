@@ -118,7 +118,8 @@ All defaults live in [`config.env`](config.env). For private tokens (`HF_TOKEN`,
 | `ASK_MODEL` | `1` | Prompt to select a model matched to your GPU RAM and Google Drive cache |
 | `CONTEXT` | `262144` | Context window size in tokens (`262144` = 256K tokens) |
 | `TUNE_ON_START` | `0` | Set to `1` to automatically run Strata hardware calibration/tuning before loading |
-| `USE_DRIVE` | `1` | Mount Google Drive to persist and restore models from `DRIVE_DATA_DIR` |
+| `USE_DRIVE` | `1` | Mount Google Drive to persist tuned presets & configs (`<1s`) |
+| `DRIVE_MODEL_CACHE` | `0` | `0` = download GGUF directly from Hugging Face (fast); `1` = restore & back up GGUF files via Google Drive |
 | `DRIVE_DATA_DIR` | `/content/drive/MyDrive/Strata-data` | Google Drive folder used for persistent model storage |
 | `LOCAL_PORT` | `8080` | Local port on Windows / WSL forwarded to the Colab VM |
 | `ACTIVE_WORKLOAD_MONITOR` | `1` | Report active tuning/GPU/setup progress via `colab exec` (exits automatically when idle) |

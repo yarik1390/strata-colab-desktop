@@ -229,7 +229,7 @@ select_model() {
 
     # Detect models already cached in Google Drive
     local drive_files=""
-    if [[ "${USE_DRIVE:-1}" == 1 ]]; then
+    if [[ "${USE_DRIVE:-1}" == 1 && "${DRIVE_MODEL_CACHE:-0}" == 1 ]]; then
         local q_dd
         q_dd="$(printf '%q' "$DRIVE_DATA_DIR")"
         drive_files="$(rssh "find $q_dd -name '*.gguf' 2>/dev/null" 2>/dev/null || true)"
