@@ -25,10 +25,16 @@ uv --version
 msg sw_colab; echo
 uv tool install --force --with keyrings.alt google-colab-cli
 mkdir -p "$HOME/.config/python_keyring"
-cat > "$HOME/.config/python_keyring/keyringrc.cfg" << 'EOF'
+KEYRING_CFG="$HOME/.config/python_keyring/keyringrc.cfg"
+if [[ -f "$KEYRING_CFG" && "${FORCE_KEYRING_CONFIG:-0}" != 1 ]]; then
+    msg sw_keyring_exists "$KEYRING_CFG"; echo
+else
+    cat > "$KEYRING_CFG" << 'EOF'
 [backend]
 default-keyring=keyrings.alt.file.PlaintextKeyring
 EOF
+    msg sw_keyring_written "$KEYRING_CFG"; echo
+fi
 
 msg sw_key; echo
 if [[ ! -f "$HOME/.ssh/id_ed25519" ]]; then

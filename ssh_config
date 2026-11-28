@@ -8,8 +8,9 @@
 # directly, as `colab ssh` will allocate a new runtime if none is active.
 
 Host colab-strata
-    # Bridge SSH over the Colab CLI WebSocket proxy using the generated Ed25519 key
-    ProxyCommand colab ssh --proxy-mode -s $COLAB_SESSION -i ~/.ssh/id_ed25519
+    # Bridge SSH over the Colab CLI WebSocket proxy using the generated Ed25519 key.
+    # Resolve ~/.local/bin explicitly because OpenSSH executes ProxyCommand in a non-login shell.
+    ProxyCommand sh -c 'PATH="$HOME/.local/bin:$PATH" exec colab ssh --proxy-mode -s "${COLAB_SESSION:-strata}" -i "$HOME/.ssh/id_ed25519"'
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
     HostName colab-vm

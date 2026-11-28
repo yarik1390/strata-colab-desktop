@@ -3,9 +3,11 @@ rem Run or monitor Strata Auto-Tune through Google Colab's active-workload `cola
 rem Usage: tune.bat [thorough|quick] [coding|chat] [work|performance]
 setlocal
 chcp 65001 >nul
-set "DISTRO_OPT="
-if defined STRATA_WSL_DISTRO set "DISTRO_OPT=-d %STRATA_WSL_DISTRO%"
 title Strata Auto-Tune Monitor
-wsl.exe %DISTRO_OPT% --cd "%~dp0." -- bash -lc "bash ./tune.sh %*"
+if defined STRATA_WSL_DISTRO (
+    wsl.exe -d "%STRATA_WSL_DISTRO%" --cd "%~dp0." --exec bash -l ./tune.sh %*
+) else (
+    wsl.exe --cd "%~dp0." --exec bash -l ./tune.sh %*
+)
 echo.
 pause

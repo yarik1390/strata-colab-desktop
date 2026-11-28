@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Helper using google-colab-cli's internal client to query eligible GPUs and allocate runtimes cleanly."""
 
+import contextlib
 import json
+import os
 import sys
 import time
 import uuid
@@ -21,21 +23,20 @@ from colab_cli.state import SessionState
 from colab_cli.utils import get_status_code
 
 
-def cmd_info() -> int:
+def cmd_info(as_json: bool = False, session_name: str | None = None) -> int:
     """Authenticate (if needed), print compute unit usage, and print eligible GPUs."""
-    state.client._issue_request(
-        f"{state.client.colab_domain}/tun/m/ccu-info",
-        schema=None,
-    )
-    resp = state.client.session.get(
-        f"{state.client.colab_domain}/tun/m/ccu-info",
-        headers={"Accept": "application/json", "X-Colab-Client-Agent": "colab-cli"},
-        params={"authuser": "0"},
-    )
-    text = resp.text
-    if text.startswith(")]}'\n"):
-        text = text[5:]
-    data = json.loads(text)
+    try:
+        data = state.client._issue_request(
+            f"{state.client.colab_domain}/tun/m/ccu-info",
+            schema=dict,
+        )
+    except Exception as e:
+        print(f"[colab] Failed to fetch ccu-info: {_format_error(e)}", file=sys.stderr)
+        return 1
+
+    if not isinstance(data, dict):
+        print("[colab] Empty or invalid ccu-info response.", file=sys.stderr)
+        return 1
 
     balance = float(data.get("currentBalance", 0.0))
     rate = float(data.get("consumptionRateHourly", 0.0))
@@ -47,6 +48,46 @@ def cmd_info() -> int:
     eligible_sorted = [g for g in order if g in eligible] + [
         g for g in eligible if g not in order
     ]
+
+    if as_json:
+        runtime_active = False
+        if session_name:
+            try:
+                has_local = False
+                getter = getattr(state.store, "get", None)
+                if callable(getter):
+                    has_local = getter(session_name) is not None
+                if count > 0 or has_local:
+                    with contextlib.redirect_stdout(sys.stderr):
+                        sessions, assignments = state.sync_sessions()
+                        if session_name in sessions:
+                            runtime_active = True
+                        elif assignments:
+                            a = assignments[0]
+                            _save_session(
+                                name=session_name,
+                                endpoint=a.endpoint,
+                                token=a.runtime_proxy_info.token,
+                                url=a.runtime_proxy_info.url,
+                                expires_at=a.runtime_proxy_info.expires_at(),
+                                variant=a.variant.name,
+                                accelerator=a.accelerator.value,
+                                machine_shape=a.machine_shape.name,
+                            )
+                            runtime_active = True
+            except Exception as e:
+                print(f"[colab] Session sync warning: {_format_error(e)}", file=sys.stderr)
+                runtime_active = count > 0
+        payload = {
+            "cu_balance": round(balance, 4),
+            "cu_rate": round(rate, 4),
+            "assignments_count": count,
+            "eligible_gpus": eligible_sorted,
+            "ineligible_gpus": list(ineligible),
+            "runtime_active": runtime_active,
+        }
+        print(json.dumps(payload))
+        return 0
 
     print(f"    Current balance: {balance:.2f} compute units")
     print(f"    Usage rate: {rate:.2f}/hr")
@@ -183,6 +224,7 @@ def _assign_single_shape(name: str, accelerator: Accelerator, shape: Shape) -> i
     Only waits and retries once when a 502/503/504/Timeout occurred after >=20s
     (characteristic of cold-booting VMs past Colab's 30s HTTP proxy cutoff).
     Fast capacity refusals (412 or <20s 503) return code 2 immediately.
+    TooManyAssignmentsError returns code 4 immediately.
     """
     variant = Variant.GPU
     nbh = uuid.uuid4()
@@ -210,7 +252,7 @@ def _assign_single_shape(name: str, accelerator: Accelerator, shape: Shape) -> i
                 f"[colab] {accelerator.value} ({_shape_label(shape)}): {_format_error(e)}",
                 file=sys.stderr,
             )
-            return 2
+            return 4
         except Exception as e:
             elapsed = time.monotonic() - t0
             status = get_status_code(e) if isinstance(e, ColabRequestError) else None
@@ -289,7 +331,7 @@ def _assign_gpu_with_fallback(
         rc = _assign_single_shape(name, accelerator, shape)
         if rc == 0:
             return 0, _shape_label(shape)
-        if rc in (1, 3):
+        if rc in (1, 3, 4):
             return rc, ""
 
     return 2, ""
@@ -302,6 +344,7 @@ def cmd_assign(name: str, gpu_str: str, high_mem_str: str) -> int:
       0 - Allocated and saved to session store
       2 - No capacity available right now (503 / 502 / 504 / 412 / timeout)
       3 - Account not eligible / quota rejected (400)
+      4 - Too many concurrent assignments (TooManyAssignmentsError)
       1 - Other error
     """
     rc, _ = _assign_gpu_with_fallback(name, gpu_str, high_mem_str)
@@ -312,6 +355,7 @@ def cmd_auto_assign(name: str, gpus_csv: str, high_mem_str: str) -> int:
     """Try candidate GPUs in preference order until one succeeds.
 
     Prints ASSIGNED_GPU=<GPU>:<SHAPE> to stdout on success.
+    Stops immediately with exit code 4 on TooManyAssignmentsError.
     """
     gpus = [
         g.strip().upper()
@@ -329,17 +373,22 @@ def cmd_auto_assign(name: str, gpus_csv: str, high_mem_str: str) -> int:
             continue
         adopted, adopted_shape = _adopt_matching_assignment(name, acc)
         if adopted:
-            print(f"ASSIGNED_GPU={gpu_str}:{adopted_shape}")
+            print(f"ASSIGNED_GPU={gpu_str}:{adopted_shape}", flush=True)
             return 0
 
+    ui_host = os.environ.get("STRATA_UI_HOST") == "1"
     saw_nocap = False
     saw_not_entitled = False
     for gpu_str in gpus:
-        print(f"[colab] Trying {gpu_str}...", file=sys.stderr)
+        if ui_host:
+            print(f"[STRATA_STATE:probing:{gpu_str}]", flush=True)
+        print(f"[colab] Trying {gpu_str}...", file=sys.stderr, flush=True)
         rc, chosen_shape = _assign_gpu_with_fallback(name, gpu_str, high_mem_str)
         if rc == 0:
-            print(f"ASSIGNED_GPU={gpu_str}:{chosen_shape}")
+            print(f"ASSIGNED_GPU={gpu_str}:{chosen_shape}", flush=True)
             return 0
+        if rc == 4:
+            return 4
         if rc == 2:
             saw_nocap = True
         elif rc == 3:
@@ -352,23 +401,48 @@ def cmd_auto_assign(name: str, gpus_csv: str, high_mem_str: str) -> int:
     return 1
 
 
+def _usage() -> int:
+    print(
+        "Usage: colab-helper.py <info [--json] [--session NAME] | adopt NAME | assign NAME GPU HIGH_MEM | auto-assign NAME GPUS_CSV HIGH_MEM>",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def main() -> int:
     if len(sys.argv) < 2:
-        print(
-            "Usage: colab-helper.py <info|adopt|assign|auto-assign> ...",
-            file=sys.stderr,
-        )
-        return 1
+        return _usage()
     cmd = sys.argv[1]
     if cmd == "info":
-        return cmd_info()
+        as_json = False
+        session_name = None
+        i = 2
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "--json":
+                as_json = True
+                i += 1
+            elif arg == "--session":
+                if i + 1 >= len(sys.argv):
+                    return _usage()
+                session_name = sys.argv[i + 1]
+                i += 2
+            else:
+                return _usage()
+        return cmd_info(as_json=as_json, session_name=session_name)
     if cmd == "adopt":
+        if len(sys.argv) < 3:
+            return _usage()
         return cmd_adopt_existing(sys.argv[2])
     if cmd == "assign":
+        if len(sys.argv) < 5:
+            return _usage()
         return cmd_assign(sys.argv[2], sys.argv[3], sys.argv[4])
     if cmd == "auto-assign":
+        if len(sys.argv) < 5:
+            return _usage()
         return cmd_auto_assign(sys.argv[2], sys.argv[3], sys.argv[4])
-    return 1
+    return _usage()
 
 
 if __name__ == "__main__":

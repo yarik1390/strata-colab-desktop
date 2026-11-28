@@ -14,20 +14,32 @@ close_link
 stop_workload_monitor
 
 # Adopt any orphaned server-side assignment before stopping
-if py="$(colab_python 2>/dev/null)"; then
-    "$py" "$ROOT/lib/colab-helper.py" adopt "$COLAB_SESSION" >/dev/null 2>&1 || true
-fi
+adopt_existing_session
 
 if session_exists; then
-    # If a Google Drive model backup is currently in flight, wait for completion (Ctrl+C skips waiting)
+    # If a Google Drive model backup is currently in flight, wait for completion (Ctrl+C skips waiting).
+    # Verify the backup process is actually alive and enforce a bounded max wait so stale status never hangs.
     if [[ "${USE_DRIVE:-1}" == 1 ]]; then
         if [[ "${DRIVE_MODEL_CACHE:-0}" == 1 ]]; then
+            max_wait_sec="${DOWN_DRIVE_SYNC_MAX_WAIT_SEC:-1800}"
+            waited_sec=0
             while true; do
-                dstat="$(rssh "cat /tmp/strata-drive-sync.status 2>/dev/null" 2>/dev/null || true)"
+                sync_probe="$(rssh "if pgrep -f '[s]trata-drive-cache.py backup' >/dev/null 2>&1; then echo ALIVE; else echo DEAD; fi; cat /tmp/strata-drive-sync.status 2>/dev/null || true" 2>/dev/null || true)"
+                proc_state="$(sed -n '1p' <<<"$sync_probe")"
+                dstat="$(sed -n '2p' <<<"$sync_probe")"
                 case "$dstat" in
                     SYNCING:*)
+                        if [[ "$proc_state" != "ALIVE" ]]; then
+                            warn "$(msg down_drive_sync_stale)"
+                            break
+                        fi
+                        if (( waited_sec >= max_wait_sec )); then
+                            warn "$(msg down_drive_sync_timeout "$max_wait_sec")"
+                            break
+                        fi
                         log "$(msg down_waiting_drive_sync "${dstat#SYNCING:}")"
                         sleep 5 || break
+                        waited_sec=$((waited_sec + 5))
                         ;;
                     *)
                         break

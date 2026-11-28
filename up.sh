@@ -147,17 +147,36 @@ select_and_create_runtime() {
             candidates_csv="$(IFS=,; echo "${candidates[*]}")"
             log "$(msg gpu_auto_starting "$candidates_csv")"
 
-            local assign_out="" rc=0
-            assign_out="$("$py" "$ROOT/lib/colab-helper.py" auto-assign "$COLAB_SESSION" "$candidates_csv" "${HIGH_MEM:-0}")" || rc=$?
+            local assign_line="" assigned_line="" helper_pid="" rc=0
+            exec 3< <("$py" "$ROOT/lib/colab-helper.py" auto-assign "$COLAB_SESSION" "$candidates_csv" "${HIGH_MEM:-0}")
+            helper_pid=$!
+            while IFS= read -r assign_line <&3; do
+                case "$assign_line" in
+                    ASSIGNED_GPU=*)
+                        assigned_line="${assign_line#ASSIGNED_GPU=}"
+                        ;;
+                    \[STRATA_STATE:*)
+                        printf '%s\n' "$assign_line"
+                        ;;
+                esac
+            done
+            exec 3<&-
+            wait "$helper_pid" || rc=$?
+
             if (( rc == 0 )); then
-                local assigned_line="${assign_out##*ASSIGNED_GPU=}"
-                assigned_line="${assigned_line%%$'\n'*}"
-                local assigned_gpu="${assigned_line%%:*}"
-                local assigned_shape="${assigned_line#*:}"
+                local assigned_gpu="" assigned_shape="STANDARD"
+                if [[ -n "$assigned_line" ]]; then
+                    assigned_gpu="${assigned_line%%:*}"
+                    if [[ "$assigned_line" == *:* ]]; then
+                        assigned_shape="${assigned_line#*:}"
+                    fi
+                fi
                 [[ -n "$assigned_gpu" ]] && GPU="$assigned_gpu"
                 log "$(msg gpu_auto_selected "$GPU" "${assigned_shape:-STANDARD}")"
                 EXPECT_GPU_REGEX="$(expect_gpu_regex_for "$GPU")"
                 return 0
+            elif (( rc == 4 )); then
+                die "$(msg gpu_too_many_assignments)"
             fi
             warn "$(msg gpu_auto_all_failed "$candidates_csv")"
             for g in "${candidates[@]}"; do no_cap[$g]=1; done
@@ -170,6 +189,7 @@ select_and_create_runtime() {
         if [[ "$HIGH_MEM" == 1 && "$GPU" != "G4" && "$GPU" != "H100" && "$GPU" != "L4" ]]; then
             hm_flag=" --high-mem"
         fi
+        emit_ui_state "probing:$GPU"
         log "$(msg runtime_creating "colab new -s $COLAB_SESSION --gpu $GPU$hm_flag")"
 
         local rc=0
@@ -177,6 +197,8 @@ select_and_create_runtime() {
         if (( rc == 0 )); then
             EXPECT_GPU_REGEX="$(expect_gpu_regex_for "$GPU")"
             return 0
+        elif (( rc == 4 )); then
+            die "$(msg gpu_too_many_assignments)"
         elif (( rc == 2 )); then
             warn "$(msg gpu_no_capacity "$GPU")"
             no_cap[$GPU]=1
@@ -239,16 +261,16 @@ select_model() {
         [[ -n "$drive_files" ]] && grep -qi "$1" <<<"$drive_files"
     }
 
-    local -a m_keys=("UD-Q4_K_XL" "IQ2_XS" "Q2_0" "IQ1_M" "IQ3_S")
-    local -a m_cached=(0 0 0 0 0)
+    local -a m_keys=("UD-Q4_K_XL" "IQ2_XS" "Q2_0" "IQ1_M" "IQ3_S" "NVFP4")
+    local -a m_cached=(0 0 0 0 0 0)
     local i
-    for i in 0 1 2 3 4; do
+    for i in 0 1 2 3 4 5; do
         if is_model_cached "${m_keys[$i]}"; then
             m_cached[$i]=1
         fi
     done
     if (( m_cached[def_num - 1] == 0 )); then
-        for i in 0 1 2 3 4; do
+        for i in 0 1 2 3 4 5; do
             if (( m_cached[i] == 1 )); then
                 def_num=$((i + 1))
                 break
@@ -269,36 +291,53 @@ select_model() {
     printf "    2) Qwen3.8-Flash    [IQ2_XS]      (~68 GB download, 35.5 GB RAM, recommended for L4 52GB)%s\n" "$(model_tags 2)"
     printf "    3) Qwen3.8-Flash    [Q2_0]        (~66 GB download, 34.0 GB RAM, fastest full Qwen3.8)%s\n" "$(model_tags 3)"
     printf "    4) Qwen3.8-Coder    [IQ1_M]       (~36 GB download, 23.0 GB RAM, coding specialist)%s\n" "$(model_tags 4)"
-    printf "    5) Qwen3.8-Flash    [IQ3_S]       (~84 GB download, 50.0 GB RAM, best for G4/A100/H100)%s\n" "$(model_tags 5)"
+    printf "    5) Qwen3.8-Flash    [IQ3_S]       (~84 GB download, 50.0 GB RAM, best for A100/H100)%s\n" "$(model_tags 5)"
+    printf "    6) Qwen3.8-Flash    [NVFP4]       (~63 GB download, native Blackwell FP4, best for G4 98GB)%s\n" "$(model_tags 6)"
     echo
 
-    local ans=""
-    read -r -p "$(msg model_select_prompt "$def_num")" ans || ans=""
-    ans="${ans//[[:space:]]/}"
-    [[ -z "$ans" ]] && ans="$def_num"
+    while true; do
+        local ans=""
+        if ! read -r -p "$(msg model_select_prompt "$def_num")" ans; then
+            ans="$def_num"
+        fi
+        ans="${ans//[[:space:]]/}"
+        [[ -z "$ans" ]] && ans="$def_num"
 
-    case "$ans" in
-        1) MODEL_FAMILY="qwen36"; MODEL="UD-Q4_K_XL" ;;
-        2) MODEL_FAMILY="";       MODEL="IQ2_XS" ;;
-        3) MODEL_FAMILY="";       MODEL="Q2_0" ;;
-        4) MODEL_FAMILY="coder";  MODEL="IQ1_M" ;;
-        5) MODEL_FAMILY="";       MODEL="IQ3_S" ;;
-        *) ;;
-    esac
+        case "$ans" in
+            1) MODEL_FAMILY="qwen36"; MODEL="UD-Q4_K_XL"; break ;;
+            2) MODEL_FAMILY="";       MODEL="IQ2_XS";     break ;;
+            3) MODEL_FAMILY="";       MODEL="Q2_0";       break ;;
+            4) MODEL_FAMILY="coder";  MODEL="IQ1_M";      break ;;
+            5) MODEL_FAMILY="";       MODEL="IQ3_S";      break ;;
+            6) MODEL_FAMILY="nvfp4";  MODEL="NVFP4";      break ;;
+            *) warn "$(msg model_invalid_choice "$ans" 6)" ;;
+        esac
+    done
 }
 
 check_gpu() {
-    local gpu
-    gpu="$(rssh "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader" 2>/dev/null | head -n 1 || true)"
+    local gpu="" attempt
+    for attempt in 1 2 3; do
+        gpu="$(rssh "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader" 2>/dev/null | head -n 1 || true)"
+        [[ -n "${gpu//[[:space:]]/}" ]] && break
+        sleep 3
+    done
     log "$(msg gpu_line "${gpu:-$(msg gpu_unknown)}")"
-    [[ "$gpu" =~ $EXPECT_GPU_REGEX ]] && return 0
+    [[ -n "$gpu" && "$gpu" =~ $EXPECT_GPU_REGEX ]] && return 0
 
     warn "$(msg gpu_mismatch "$EXPECT_GPU_REGEX")"
-    local ans
+    local ans="n"
     case "$ON_GPU_MISMATCH" in
         continue) return 0 ;;
         stop) ans=n ;;
-        *) read -r -p "$(msg gpu_continue_prompt)" ans || ans=n ;;
+        *)
+            if [[ -t 0 ]]; then
+                read -r -p "$(msg gpu_continue_prompt)" ans || ans=n
+            else
+                warn "Non-interactive session detected; aborting on GPU mismatch (set ON_GPU_MISMATCH=continue to override)."
+                ans=n
+            fi
+            ;;
     esac
     [[ "$ans" =~ ^[yY] ]] && return 0
 
@@ -310,6 +349,7 @@ check_gpu() {
 
 main() {
     require_cmds colab ssh curl ss
+    reset_workload_log
 
     log "$(msg units_left)"
     fetch_colab_info
@@ -322,13 +362,14 @@ main() {
     wait_ssh
     check_gpu
 
-    # 3. Mount Google Drive for persistent model caching & fast restore
+    # 3. Mount Google Drive for persistent presets/configs (and optional model cache)
     ensure_drive_mounted
 
     # 4. Select Strata model matched to GPU memory and Drive cache status
     select_model
 
     # 5. Provision and start Strata (Desktop UI or CLI server) inside tmux on the VM
+    emit_ui_state "starting"
     log "$(msg preparing)"
     remote_start 0
 

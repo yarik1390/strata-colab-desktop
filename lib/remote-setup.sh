@@ -6,7 +6,9 @@
 # Environment variables received:
 #   STRATA_REPO, REMOTE_DIR, DATA_DIR, MODEL, CONTEXT, REMOTE_PORT,
 #   STRATA_EXTRA_ARGS, REMOTE_LOG, MODEL_FAMILY, MODEL_REPO, MODEL_FILES,
-#   MODEL_REVISION, USE_DRIVE, DRIVE_DATA_DIR, UI_MODE, TUNE_ON_START,
+#   MODEL_REVISION, USE_DRIVE, DRIVE_MODEL_CACHE, DRIVE_DATA_DIR, UI_MODE,
+#   TUNE_ON_START, HF_XET_HIGH_PERFORMANCE, STRATA_UV, STRATA_KV_CACHE,
+#   STRATA_VISION, STRATA_DRAFTER, STRATA_PREFILL_NVFP4,
 #   FORCE_RESTART (0 = start if not running, 1 = retry setup, 2 = force restart)
 #   API_KEY and HF_TOKEN are prepended via stdin so they never appear in argv.
 set -euo pipefail
@@ -15,12 +17,36 @@ TMUX_SESSION=strata
 EXIT_MARK='[strata-colab-cli] setup.sh exited'
 PORT_ERR_RE='already in use|address in use|eaddrinuse'
 FORCE_RESTART="${FORCE_RESTART:-0}"
+UI_MODE="${UI_MODE:-desktop}"
+TUNE_ON_START="${TUNE_ON_START:-0}"
+MODEL_FAMILY="${MODEL_FAMILY:-}"
+MODEL_REPO="${MODEL_REPO:-}"
+MODEL_FILES="${MODEL_FILES:-}"
+MODEL_REVISION="${MODEL_REVISION:-}"
+STRATA_EXTRA_ARGS="${STRATA_EXTRA_ARGS:-}"
+STRATA_KV_CACHE="${STRATA_KV_CACHE:-}"
+STRATA_VISION="${STRATA_VISION:-}"
+STRATA_DRAFTER="${STRATA_DRAFTER:-}"
+API_KEY="${API_KEY:-}"
+HF_TOKEN="${HF_TOKEN:-}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+export STRATA_UV="${STRATA_UV:-1}"
+if [[ "${MODEL_FAMILY,,}" == "nvfp4" ]]; then
+    export STRATA_PREFILL_NVFP4="${STRATA_PREFILL_NVFP4:-w4a4}"
+fi
+ENGINE_PORT=$((REMOTE_PORT + 1))
+TARGET_ENGINE_PORT="$REMOTE_PORT"
+[[ "$UI_MODE" == "desktop" ]] && TARGET_ENGINE_PORT="$ENGINE_PORT"
 
 rmsg() { echo "[remote] $(msg "$@")"; }
+is_remote_healthy() {
+    curl -sf -m 5 "http://127.0.0.1:$REMOTE_PORT/health" >/dev/null 2>&1 || \
+        curl -sf -m 5 "http://127.0.0.1:$REMOTE_PORT/api/health" >/dev/null 2>&1
+}
 
 if [[ "$FORCE_RESTART" == 2 ]]; then
     rmsg r_restart
-elif curl -sf -m 5 "http://127.0.0.1:$REMOTE_PORT/health" >/dev/null 2>&1; then
+elif is_remote_healthy; then
     rmsg r_already_running
     exit 0
 elif command -v tmux >/dev/null 2>&1 && tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
@@ -66,7 +92,14 @@ strata_pids() {
     return 0
 }
 port_pids() {
-    ss -ltnpH "sport = :$REMOTE_PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+    local ports=("$@") port
+    if (( ${#ports[@]} == 0 )); then
+        ports=("$REMOTE_PORT")
+        [[ "$UI_MODE" == "desktop" ]] && ports+=("$ENGINE_PORT")
+    fi
+    for port in "${ports[@]}"; do
+        ss -ltnpH "sport = :$port" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2
+    done | sort -u
 }
 kill_and_wait() {
     local p alive i
@@ -89,23 +122,27 @@ if (( ${#old[@]} > 0 )); then
     kill_and_wait "${old[@]}"
 fi
 
-mapfile -t holders < <(port_pids)
-if (( ${#holders[@]} > 0 )); then
-    others=""
-    for p in "${holders[@]}"; do
-        if is_strata_pid "$p"; then
-            kill_and_wait "$p"
-        else
-            others+="  pid $p: $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-120)"$'\n'
+check_ports=("$REMOTE_PORT")
+[[ "$UI_MODE" == "desktop" ]] && check_ports+=("$ENGINE_PORT")
+for check_port in "${check_ports[@]}"; do
+    mapfile -t holders < <(port_pids "$check_port")
+    if (( ${#holders[@]} > 0 )); then
+        others=""
+        for p in "${holders[@]}"; do
+            if is_strata_pid "$p"; then
+                kill_and_wait "$p"
+            else
+                others+="  pid $p: $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-120)"$'\n'
+            fi
+        done
+        if [[ -n "$others" ]]; then
+            rmsg r_port_other "$check_port"
+            printf '%s' "$others"
+            rmsg r_port_other_hint
+            exit 3
         fi
-    done
-    if [[ -n "$others" ]]; then
-        rmsg r_port_other "$REMOTE_PORT"
-        printf '%s' "$others"
-        rmsg r_port_other_hint
-        exit 3
     fi
-fi
+done
 
 # ----- Clone Strata Repository -----
 if [[ ! -d "$REMOTE_DIR/.git" ]]; then
@@ -138,10 +175,48 @@ ln -sf "$PY" "$PY_SHIM_DIR/python3"
 ln -sf "$PY" "$PY_SHIM_DIR/python"
 rmsg r_py "$PY" "$("$PY" --version 2>&1)"
 
+# ----- Ensure uv Is Available for Fast Cold-Start Venv Setup -----
+if [[ "$STRATA_UV" == 1 ]]; then
+    UV_BIN=""
+    find_uv() {
+        local c
+        for c in "$(command -v uv 2>/dev/null || true)" \
+                 "$HOME/.local/bin/uv" \
+                 "$HOME/.cargo/bin/uv" \
+                 "/usr/local/bin/uv" \
+                 "$(dirname "$PY")/uv"; do
+            if [[ -n "$c" && -x "$c" ]]; then
+                echo "$c"
+                return 0
+            fi
+        done
+        return 1
+    }
+    if ! UV_BIN="$(find_uv)"; then
+        echo "[remote] Installing uv for faster Strata Python setup..."
+        if command -v curl >/dev/null 2>&1; then
+            (curl -LsSf --connect-timeout 10 --max-time 60 https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh) >/dev/null 2>&1 || true
+        fi
+        UV_BIN="$(find_uv)" || true
+    fi
+    if [[ -z "$UV_BIN" ]]; then
+        "$PY" -m pip install -q --disable-pip-version-check --user uv >/dev/null 2>&1 || \
+            "$PY" -m pip install -q --disable-pip-version-check --break-system-packages uv >/dev/null 2>&1 || true
+        UV_BIN="$(find_uv)" || true
+    fi
+    if [[ -n "$UV_BIN" ]]; then
+        ln -sf "$UV_BIN" "$PY_SHIM_DIR/uv"
+        echo "[remote] uv available: $UV_BIN"
+    else
+        echo "[remote] uv unavailable; falling back to standard venv/pip."
+        export STRATA_UV=0
+    fi
+fi
+
 # ----- Synchronize Saved Run Config Ports -----
 for f in "$REMOTE_DIR"/strata-*.json "$REMOTE_DIR"/terminal/strata-*.json; do
     [[ -f "$f" ]] || continue
-    old_ports="$("$PY" - "$f" "$REMOTE_PORT" <<'PYEOF'
+    old_ports="$("$PY" - "$f" "$TARGET_ENGINE_PORT" <<'PYEOF'
 import json, sys
 path, port = sys.argv[1], int(sys.argv[2])
 with open(path, encoding="utf-8") as fh:
@@ -152,19 +227,24 @@ changed = []
 if "port" in cfg and str(cfg["port"]) != str(port):
     changed.append(str(cfg["port"]))
     cfg["port"] = port
-args = cfg.get("args")
-if isinstance(args, list):
-    for i, a in enumerate(args[:-1]):
-        if a == "--port" and str(args[i + 1]) != str(port):
-            changed.append(str(args[i + 1]))
-            args[i + 1] = str(port)
+for key in ("args", "args_written"):
+    args = cfg.get(key)
+    if isinstance(args, list):
+        for i, a in enumerate(args):
+            s = str(a)
+            if s == "--port" and i + 1 < len(args) and str(args[i + 1]) != str(port):
+                changed.append(str(args[i + 1]))
+                args[i + 1] = str(port)
+            elif s.startswith("--port=") and s[7:] != str(port):
+                changed.append(s[7:])
+                args[i] = f"--port={port}"
 if changed:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=False)
     print(", ".join(sorted(set(changed))))
 PYEOF
 )"
-    [[ -z "$old_ports" ]] || rmsg r_port_fixed "$f" "$old_ports" "$REMOTE_PORT"
+    [[ -z "$old_ports" ]] || rmsg r_port_fixed "$f" "$old_ports" "$TARGET_ENGINE_PORT"
 done
 
 # ----- Custom Hugging Face GGUF Repository (Optional) -----
@@ -183,8 +263,8 @@ if [[ -n "$MODEL_REPO" ]]; then
     else
         rm -f "$HF_TOKEN_FILE"
     fi
-    hf_env=()
-    [[ -f "$HF_TOKEN_FILE" ]] && hf_env=(HF_TOKEN_PATH="$HF_TOKEN_FILE")
+    hf_env=(HF_XET_HIGH_PERFORMANCE="$HF_XET_HIGH_PERFORMANCE")
+    [[ -f "$HF_TOKEN_FILE" ]] && hf_env+=(HF_TOKEN_PATH="$HF_TOKEN_FILE")
 
     if [[ ! -x "$HF_VENV/bin/hf" ]]; then
         rmsg r_hf_install
@@ -256,7 +336,7 @@ PYEOF
 
     dl=("$HF_VENV/bin/hf" download "$MODEL_REPO" --include "$PATTERN" --local-dir "$CUSTOM_DIR")
     [[ -n "$MODEL_REVISION" ]] && dl+=(--revision "$MODEL_REVISION")
-    FETCH_CMD="env $(printf '%q ' "${hf_env[@]}" "${dl[@]}") && "
+    FETCH_CMD="env $(printf '%q ' "${hf_env[@]}" "${dl[@]}")"
 fi
 
 # ----- Google Drive Persistent Cache & Fast Local SSD Restore -----
@@ -445,13 +525,10 @@ def copy_with_progress(
 
             os.fsync(dst_fd)
             done_parallel = True
-        except OSError:
+        except (OSError, EOFError):
             copied = 0
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+            last_print = 0.0
+            start_t = time.time()
         finally:
             if src_fd >= 0:
                 try:
@@ -461,6 +538,12 @@ def copy_with_progress(
             if dst_fd >= 0:
                 try:
                     os.close(dst_fd)
+                except OSError:
+                    pass
+            if not done_parallel:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
                 except OSError:
                     pass
 
@@ -588,11 +671,14 @@ def cmd_sync_config(drive_dir: str, remote_dir: str) -> int:
 
     preset_count = 0
     if os.path.isdir(presets_dst):
-        preset_count = sum(
-            1
-            for fn in os.listdir(presets_dst)
-            if fn.endswith(".json") and fn != "active.json" and os.path.isfile(os.path.join(presets_dst, fn))
-        )
+        try:
+            preset_count = sum(
+                1
+                for fn in os.listdir(presets_dst)
+                if fn.endswith(".json") and fn != "active.json" and os.path.isfile(os.path.join(presets_dst, fn))
+            )
+        except OSError:
+            preset_count = 0
 
     if changed > 0:
         print(f"[config-sync] Synced {changed} file(s) to {cfg_root}", flush=True)
@@ -644,16 +730,24 @@ def _restore_dir_files(
 
 
 def _arg_val(args: list, flag: str) -> str | None:
-    for i in range(len(args) - 1):
-        if str(args[i]) == flag:
+    prefix = flag + "="
+    for i, tok in enumerate(args):
+        s = str(tok)
+        if s == flag and i + 1 < len(args):
             return str(args[i + 1])
+        if s.startswith(prefix):
+            return s[len(prefix):]
     return None
 
 
 def _set_arg_val(args: list, flag: str, value: str) -> None:
-    for i in range(len(args) - 1):
-        if str(args[i]) == flag:
+    prefix = flag + "="
+    for i in range(len(args)):
+        tok = str(args[i])
+        if tok == flag and i + 1 < len(args):
             args[i + 1] = value
+        elif tok.startswith(prefix):
+            args[i] = prefix + value
 
 
 def _find_active_preset_goal(
@@ -791,6 +885,10 @@ def cmd_restore_config(
                     cfg["port"] = int(port)
                 except ValueError:
                     pass
+                for k in ("args", "args_written"):
+                    arr = cfg.get(k)
+                    if isinstance(arr, list):
+                        _set_arg_val(arr, "--port", str(port))
                 cfg["ui_context_chosen"] = True
 
             if not cfg.get("ui_resource_profile"):
@@ -907,11 +1005,14 @@ def cmd_restore(drive_dir: str, data_dir: str, model: str) -> int:
 
 
 def is_healthy(port: str) -> bool:
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as r:
-            return r.status == 200
-    except Exception:
-        return False
+    for path in ("/health", "/api/health"):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def is_calibrating() -> bool:
@@ -949,7 +1050,10 @@ def cmd_backup_loop(data_dir: str, drive_dir: str, port: str, remote_dir: str = 
     drive_parent = os.path.dirname(drive_dir.rstrip("/"))
     if not os.path.isdir(drive_parent):
         return 0
-    os.makedirs(drive_dir, exist_ok=True)
+    try:
+        os.makedirs(drive_dir, exist_ok=True)
+    except OSError:
+        pass
     write_status("IDLE")
     synced_any = False
     initial_done = False
@@ -962,7 +1066,10 @@ def cmd_backup_loop(data_dir: str, drive_dir: str, port: str, remote_dir: str = 
             continue
         if not os.path.isdir(data_dir):
             if remote_dir:
-                cmd_sync_config(drive_dir, remote_dir)
+                try:
+                    cmd_sync_config(drive_dir, remote_dir)
+                except OSError:
+                    pass
             continue
 
         healthy = is_healthy(port)
@@ -987,15 +1094,27 @@ def cmd_backup_loop(data_dir: str, drive_dir: str, port: str, remote_dir: str = 
                         continue
                     rel = os.path.relpath(full, data_dir)
                     dst = os.path.join(drive_dir, rel)
-                    size = os.path.getsize(full)
-                    if not (os.path.isfile(dst) and os.path.getsize(dst) == size):
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        continue
+                    try:
+                        dst_matches = os.path.isfile(dst) and os.path.getsize(dst) == size
+                    except OSError:
+                        dst_matches = False
+                    if not dst_matches:
                         pending.append((rel, full, dst, size))
 
             for rel, full, dst, size in pending:
                 if is_calibrating():
                     write_config_status("WAITING_FOR_TUNE")
                     break
-                free_bytes = shutil.disk_usage(drive_dir).free
+                try:
+                    os.makedirs(drive_dir, exist_ok=True)
+                    free_bytes = shutil.disk_usage(drive_dir).free
+                except OSError as e:
+                    write_status(f"ERROR:{e}")
+                    break
                 if size + (512 * 1024 * 1024) > free_bytes:
                     write_status(f"NO_SPACE:{size / 1e9:.1f}:{free_bytes / 1e9:.1f}")
                     no_space = True
@@ -1011,7 +1130,10 @@ def cmd_backup_loop(data_dir: str, drive_dir: str, port: str, remote_dir: str = 
 
         if healthy and not pending and not is_calibrating():
             if remote_dir:
-                cmd_sync_config(drive_dir, remote_dir)
+                try:
+                    cmd_sync_config(drive_dir, remote_dir)
+                except OSError:
+                    pass
             if not initial_done:
                 write_status("DONE" if synced_any else "CACHED")
                 initial_done = True
@@ -1046,33 +1168,68 @@ RESTORE_CMD=""
 POST_DRIVE_DIR=""
 if [[ "$USE_DRIVE" == 1 ]]; then
     if [[ "${DRIVE_MODEL_CACHE:-0}" == 1 ]]; then
-        RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && $PY $DRIVE_CACHE_SCRIPT restore $(printf '%q ' "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL") && "
+        RESTORE_CMD="    $(printf '%q ' "$PY" "$DRIVE_CACHE_SCRIPT" restore-config "$DRIVE_DATA_DIR" "$REMOTE_DIR" pre)
+    $(printf '%q ' "$PY" "$DRIVE_CACHE_SCRIPT" restore "$DRIVE_DATA_DIR" "$DATA_DIR" "$MODEL")"
     else
-        RESTORE_CMD="$PY $DRIVE_CACHE_SCRIPT restore-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR") pre && echo '[remote] Google Drive config sync enabled (DRIVE_MODEL_CACHE=0: downloading GGUF directly from Hugging Face).' && "
+        RESTORE_CMD="    $(printf '%q ' "$PY" "$DRIVE_CACHE_SCRIPT" restore-config "$DRIVE_DATA_DIR" "$REMOTE_DIR" pre)
+    echo '[remote] Google Drive config sync enabled (DRIVE_MODEL_CACHE=0: downloading GGUF directly from Hugging Face).'"
     fi
     POST_DRIVE_DIR="$DRIVE_DATA_DIR"
 fi
 
-UI_MODE="${UI_MODE:-desktop}"
-TUNE_ON_START="${TUNE_ON_START:-0}"
-ENGINE_PORT=$((REMOTE_PORT + 1))
-
-args=(--model "$MODEL" --context "$CONTEXT" --port "$([[ "$UI_MODE" == "desktop" ]] && echo "$ENGINE_PORT" || echo "$REMOTE_PORT")"
+args=(--model "$MODEL" --context "$CONTEXT" --port "$TARGET_ENGINE_PORT"
       --data-dir "$DATA_DIR" --no-browser --yes)
 [[ "$UI_MODE" == "desktop" ]] && args+=(--no-start)
 [[ -n "$MODEL_FAMILY" ]] && args+=(--family "$MODEL_FAMILY")
 [[ -n "$GGUF_DIR" ]] && args+=(--gguf-dir "$GGUF_DIR")
-[[ -n "$API_KEY" ]] && args+=(--api-key "$API_KEY")
-# shellcheck disable=SC2086,SC2206
-[[ -n "$STRATA_EXTRA_ARGS" ]] && args+=($STRATA_EXTRA_ARGS)
+[[ -n "$STRATA_KV_CACHE" ]] && args+=(--kv "$STRATA_KV_CACHE")
+[[ -n "$STRATA_VISION" ]] && args+=(--vision "$STRATA_VISION")
+[[ -n "$STRATA_DRAFTER" ]] && args+=(--drafter "$STRATA_DRAFTER")
+if [[ -n "$STRATA_EXTRA_ARGS" ]]; then
+    if ! "$PY" -c 'import shlex, sys; shlex.split(sys.argv[1])' "$STRATA_EXTRA_ARGS" 2>/dev/null; then
+        echo "[remote] Invalid quoting in STRATA_EXTRA_ARGS: $STRATA_EXTRA_ARGS" >&2
+        exit 1
+    fi
+    mapfile -d '' -t _extra_args < <(
+        "$PY" -c 'import shlex, sys
+for tok in shlex.split(sys.argv[1]):
+    sys.stdout.buffer.write(tok.encode("utf-8") + b"\0")
+' "$STRATA_EXTRA_ARGS"
+    )
+    if (( ${#_extra_args[@]} > 0 )); then
+        args+=("${_extra_args[@]}")
+    fi
+fi
+
+MODEL_ID="${MODEL,,}"
+if [[ -n "$MODEL_FAMILY" && "${MODEL_FAMILY,,}" != "qwen" ]]; then
+    MODEL_ID="${MODEL_FAMILY,,}-${MODEL_ID}"
+fi
+
+NVFP4_EXPORT=""
+if [[ "${MODEL_FAMILY,,}" == "nvfp4" ]]; then
+    NVFP4_EXPORT="export STRATA_PREFILL_NVFP4=$(printf '%q' "$STRATA_PREFILL_NVFP4")"
+fi
+
+API_KEY_EXPORT=""
+if [[ -n "$API_KEY" ]]; then
+    API_KEY_EXPORT="export STRATA_API_KEY=$(printf '%q' "$API_KEY")"
+fi
 
 [[ -f "$REMOTE_LOG" ]] && mv -f "$REMOTE_LOG" "$REMOTE_LOG.prev"
 
 RUN_WRAPPER="/tmp/strata-tmux-runner.sh"
-cat > "$RUN_WRAPPER" <<EOF
+(
+    umask 077
+    rm -f "$RUN_WRAPPER"
+    cat > "$RUN_WRAPPER" <<EOF
 #!/usr/bin/env bash
-set -uo pipefail
-export PATH=$(printf '%q' "$PY_SHIM_DIR"):/content/.strata-node/bin:\$PATH
+set -euo pipefail
+export PATH=$(printf '%q' "$PY_SHIM_DIR"):/content/.strata-node/bin:\$HOME/.local/bin:\$PATH
+export HF_XET_HIGH_PERFORMANCE=$(printf '%q' "$HF_XET_HIGH_PERFORMANCE")
+export STRATA_UV=$(printf '%q' "$STRATA_UV")
+${NVFP4_EXPORT}
+${API_KEY_EXPORT}
 
 if [[ $(printf '%q' "$USE_DRIVE") == 1 && -d $(printf '%q' "$(dirname "$DRIVE_DATA_DIR")") ]]; then
     if [[ $(printf '%q' "$DRIVE_MODEL_CACHE") == 1 ]]; then
@@ -1082,16 +1239,29 @@ if [[ $(printf '%q' "$USE_DRIVE") == 1 && -d $(printf '%q' "$(dirname "$DRIVE_DA
     fi
 fi
 
-cd $(printf '%q' "$REMOTE_DIR")
-{
-    ${RESTORE_CMD}${FETCH_CMD}./setup.sh $(printf '%q ' "${args[@]}")
+set +e
+(
+    set -euo pipefail
+    cd $(printf '%q' "$REMOTE_DIR")
+${RESTORE_CMD}
+    ${FETCH_CMD}
+    ./setup.sh $(printf '%q ' "${args[@]}")
 
     if [[ $(printf '%q' "$UI_MODE") == "desktop" ]]; then
         NODE_DIR=/content/.strata-node
+        NODE_TMP=/content/.strata-node.tmp
         if [[ ! -x "\$NODE_DIR/bin/node" ]]; then
             echo "[desktop] Installing Node v24.12.0 for Strata Desktop..."
-            mkdir -p "\$NODE_DIR"
-            curl -fsSL https://nodejs.org/dist/v24.12.0/node-v24.12.0-linux-x64.tar.gz | tar xz -C "\$NODE_DIR" --strip-components=1
+            rm -rf "\$NODE_TMP"
+            mkdir -p "\$NODE_TMP"
+            curl -fsSL https://nodejs.org/dist/v24.12.0/node-v24.12.0-linux-x64.tar.gz | tar xz -C "\$NODE_TMP" --strip-components=1
+            if [[ ! -x "\$NODE_TMP/bin/node" ]]; then
+                echo "[desktop] ERROR: Node binary missing after extraction." >&2
+                rm -rf "\$NODE_TMP"
+                exit 1
+            fi
+            rm -rf "\$NODE_DIR"
+            mv "\$NODE_TMP" "\$NODE_DIR"
         fi
         export PATH="\$NODE_DIR/bin:\$PATH"
         cd $(printf '%q' "$REMOTE_DIR/app/host")
@@ -1100,7 +1270,6 @@ cd $(printf '%q' "$REMOTE_DIR")
             npm ci --no-audit --no-fund
             npm run build
         fi
-        sed -i "s|if (path === '/api/health')|if (path === '/api/health' \|\| path === '/health')|g" server/index.mjs
 
         $(printf '%q' "$PY") $(printf '%q' "$DRIVE_CACHE_SCRIPT") restore-config $(printf '%q ' "$POST_DRIVE_DIR" "$REMOTE_DIR") post $(printf '%q ' "$CONTEXT" "$ENGINE_PORT" "$UI_MODE")
 
@@ -1113,16 +1282,14 @@ cd $(printf '%q' "$REMOTE_DIR")
         mkdir -p /content/Workspace
 
         (
+            set +e
             for _ in {1..30}; do
                 curl -sf "http://127.0.0.1:$REMOTE_PORT/api/health" >/dev/null 2>&1 && break
                 sleep 1
             done
             curl -sf "http://127.0.0.1:$REMOTE_PORT/api/native?refresh=1" >/dev/null 2>&1 || true
             sleep 2
-            MODEL_ID=\$(echo $(printf '%q' "$MODEL") | tr '[:upper:]' '[:lower:]')
-            if [[ -n $(printf '%q' "$MODEL_FAMILY") && $(printf '%q' "$MODEL_FAMILY") != "qwen" ]]; then
-                MODEL_ID="\$(echo $(printf '%q' "$MODEL_FAMILY") | tr '[:upper:]' '[:lower:]')-\$MODEL_ID"
-            fi
+            MODEL_ID=$(printf '%q' "$MODEL_ID")
             if [[ $(printf '%q' "$TUNE_ON_START") == 1 ]]; then
                 curl -sf -X POST "http://127.0.0.1:$REMOTE_PORT/api/native/operations" -H 'Content-Type: application/json' \
                     -d "{\"kind\":\"tune\",\"args\":{\"model\":\"\$MODEL_ID\",\"profile\":\"performance\"}}" >/dev/null 2>&1 || true
@@ -1136,15 +1303,17 @@ cd $(printf '%q' "$REMOTE_DIR")
                         -d "{\"kind\":\"load\",\"args\":{\"model\":\"\$MODEL_ID\"}}" >/dev/null 2>&1 || true
                 fi
             fi
-        ) &
+        ) </dev/null >/dev/null 2>&1 &
 
         node server/index.mjs --dist dist
     fi
-} 2>&1 | tee -a $(printf '%q' "$REMOTE_LOG")
-echo $(printf '%q' "$EXIT_MARK") | tee -a $(printf '%q' "$REMOTE_LOG")
+) 2>&1 | tee -a $(printf '%q' "$REMOTE_LOG")
+run_rc=\${PIPESTATUS[0]}
+printf '%s (code=%d)\n' $(printf '%q' "$EXIT_MARK") "\$run_rc" | tee -a $(printf '%q' "$REMOTE_LOG")
 sleep infinity
 EOF
-chmod +x "$RUN_WRAPPER"
+    chmod 0700 "$RUN_WRAPPER"
+)
 
 tmux new-session -d -s "$TMUX_SESSION" "$RUN_WRAPPER"
 rmsg r_started "$UI_MODE" "$MODEL" "$CONTEXT" "$REMOTE_PORT"

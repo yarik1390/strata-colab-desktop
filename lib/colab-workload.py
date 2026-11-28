@@ -15,6 +15,8 @@ import time
 MAX_WINDOW_SEC = int(os.environ.get("STRATA_WORKLOAD_WINDOW_SEC", "240"))
 POLL_SEC = int(os.environ.get("STRATA_WORKLOAD_POLL_SEC", "20"))
 IDLE_TICKS_TO_EXIT = int(os.environ.get("STRATA_WORKLOAD_IDLE_TICKS", "2"))
+DRIVE_DATA_DIR = os.environ.get("DRIVE_DATA_DIR", "/content/drive/MyDrive/Strata-data")
+REMOTE_DIR = os.environ.get("REMOTE_DIR", "/content/Strata")
 GPU_UTIL_THRESHOLD = 5
 
 TUNE_MARKERS = (
@@ -125,8 +127,10 @@ def _gpu_telemetry() -> tuple[int, str]:
 
 def _sync_config_if_present() -> None:
     cache_script = "/tmp/strata-drive-cache.py"
-    drive_root = "/content/drive/MyDrive"
-    if not (os.path.isfile(cache_script) and os.path.isdir(drive_root)):
+    drive_data_dir = os.environ.get("DRIVE_DATA_DIR", DRIVE_DATA_DIR)
+    remote_dir = os.environ.get("REMOTE_DIR", REMOTE_DIR)
+    drive_parent = os.path.dirname(drive_data_dir.rstrip("/")) or "/"
+    if not (os.path.isfile(cache_script) and os.path.isdir(drive_parent)):
         return
     try:
         subprocess.run(
@@ -134,8 +138,8 @@ def _sync_config_if_present() -> None:
                 "python3",
                 cache_script,
                 "sync-config",
-                "/content/drive/MyDrive/Strata-data",
-                "/content/Strata",
+                drive_data_dir,
+                remote_dir,
             ],
             check=False,
             timeout=30,
@@ -199,4 +203,5 @@ def main() -> None:
         time.sleep(min(POLL_SEC, remaining))
 
 
-main()
+if __name__ == "__main__":
+    main()

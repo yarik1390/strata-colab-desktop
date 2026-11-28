@@ -8,7 +8,7 @@
 # and persisting the resulting preset to Google Drive.
 source "$(dirname "$0")/lib/common.sh"
 
-require_cmds colab ssh curl
+require_cmds colab ssh curl python3
 
 MODE="${1:-thorough}"
 USE="${2:-coding}"
@@ -27,6 +27,7 @@ case "$PROFILE" in
     *) die "Invalid profile '$PROFILE' (expected: work or performance)" ;;
 esac
 
+adopt_existing_session
 session_exists || die "$(msg runtime_missing_start "$COLAB_SESSION")"
 
 remote_tuning_active() {
@@ -69,8 +70,14 @@ elif remote_healthy; then
         MODEL_ID="$(tr '[:upper:]' '[:lower:]' <<<"$MODEL_FAMILY")-$MODEL_ID"
     fi
     log "$(msg tune_starting "$MODE" "$USE" "$PROFILE")"
-    payload="{\"kind\":\"autotune\",\"args\":{\"model\":\"$MODEL_ID\",\"mode\":\"$MODE\",\"use\":\"$USE\",\"resourceProfile\":\"$PROFILE\",\"allowSmallDifferences\":true}}"
-    printf '%s' "$payload" | rssh "curl -sf -X POST http://127.0.0.1:$REMOTE_PORT/api/native/operations -H 'Content-Type: application/json' --data-binary @- >/dev/null" || true
+    payload="$(python3 -c 'import json, sys; print(json.dumps({"kind": "autotune", "args": {"model": sys.argv[1], "mode": sys.argv[2], "use": sys.argv[3], "resourceProfile": sys.argv[4], "allowSmallDifferences": True}}))' "$MODEL_ID" "$MODE" "$USE" "$PROFILE")"
+    resp="$(printf '%s' "$payload" | rssh "curl -sS -m 15 -w '\n%{http_code}' -X POST http://127.0.0.1:$REMOTE_PORT/api/native/operations -H 'Content-Type: application/json' --data-binary @-" 2>&1)" || true
+    http_code="$(tail -n 1 <<<"$resp" | tr -dc '0-9')"
+    http_body="$(sed '$d' <<<"$resp" | tr '\r\n' ' ' | cut -c1-240)"
+    if [[ -z "$http_code" || "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+        warn "$(msg tune_http_error "${http_code:-err}" "${http_body:-no response}")"
+        die "$(msg tune_failed_start "$LOCAL_PORT")"
+    fi
 
     started=0
     for _ in $(seq 1 10); do
@@ -85,22 +92,28 @@ else
     die "$(msg tune_failed_start "$LOCAL_PORT")"
 fi
 
-# Own the foreground `colab exec` stream while tuning runs
+# Stop any background monitor and take exclusive flock ownership of `colab exec`
 stop_workload_monitor
+exec 9>>"$WORKLOAD_LOCK_FILE"
+flock -w 15 9 || die "Could not acquire workload monitor lock ($WORKLOAD_LOCK_FILE)."
+trap 'exec 9>&-' EXIT
 
-while remote_tuning_active; do
-    colab exec -s "$COLAB_SESSION" --timeout 90 -f "$ROOT/lib/colab-workload.py" || {
-        session_exists || die "$(msg runtime_stopped "$COLAB_SESSION")"
+while remote_tuning_active 9>&-; do
+    colab exec -s "$COLAB_SESSION" --timeout 90 \
+        --env "DRIVE_DATA_DIR=$DRIVE_DATA_DIR" \
+        --env "REMOTE_DIR=$REMOTE_DIR" \
+        -f "$ROOT/lib/colab-workload.py" 9>&- || {
+        session_exists 9>&- || die "$(msg runtime_stopped "$COLAB_SESSION")"
         sleep 10
     }
 done
 
 log "$(msg tune_finished)"
 if [[ "${USE_DRIVE:-1}" == 1 ]]; then
-    rssh "if [[ -f /tmp/strata-drive-cache.py ]]; then python3 /tmp/strata-drive-cache.py sync-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR"); fi" || true
+    rssh "if [[ -f /tmp/strata-drive-cache.py ]]; then python3 /tmp/strata-drive-cache.py sync-config $(printf '%q ' "$DRIVE_DATA_DIR" "$REMOTE_DIR"); fi" 9>&- || true
 fi
 
-rssh "python3 -" <<'PY' 2>/dev/null || true
+rssh "python3 -" <<'PY' 2>/dev/null 9>&- || true
 import json, os
 idx_path = os.path.expanduser("~/.config/strata/presets/active.json")
 if os.path.isfile(idx_path):
