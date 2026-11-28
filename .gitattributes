@@ -2,8 +2,11 @@
 *.py       text eol=lf
 *.env      text eol=lf
 ssh_config text eol=lf
+.gitattributes text eol=lf
 *.md       text eol=lf
 *.ipynb    text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
 *.bat      text eol=crlf
 *.ps1      text eol=crlf
 *.psm1     text eol=crlf

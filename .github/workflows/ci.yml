@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-checks:
+    name: Linux Hygiene, Python & Shell Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run repository hygiene checks
+        run: python3 -B -m unittest -v tests/test_repo_hygiene.py
+
+      - name: Run Python helper unit tests
+        run: python3 -B -m unittest -v tests/test_python_helpers.py
+
+      - name: Run Bash orchestration unit tests
+        run: bash tests/test_shell_scripts.sh
+
+      - name: ShellCheck lint (advisory)
+        continue-on-error: true
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S warning ./*.sh lib/*.sh tests/*.sh
+          else
+            echo "shellcheck not installed; skipping"
+          fi
+
+  windows-checks:
+    name: Windows PowerShell Tests & Launcher Smoke Test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run PowerShell helper tests and WPF launcher smoke test
+        shell: cmd
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File tests\StrataHelpers.Tests.ps1

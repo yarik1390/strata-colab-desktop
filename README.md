@@ -1,5 +1,6 @@
 # Strata Colab Desktop
 
+[![CI](https://github.com/yarik1390/strata-colab-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/yarik1390/strata-colab-desktop/actions/workflows/ci.yml)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yarik1390/strata-colab-desktop/blob/main/notebooks/Strata_Colab_Quickstart.ipynb)
 
 Run the full **[Strata Desktop Application](https://github.com/Niko1221/Strata)** (with **Native G4 Blackwell `NVFP4`**, **256K context**, **Fast Cold Starts via `HF_XET_HIGH_PERFORMANCE` + `STRATA_UV`**, **1-Click Hardware Auto-Tuning**, **Instant Google Drive Preset Persistence**, and local **OpenAI / Anthropic API endpoints**) on a paid **Google Colab GPU** runtime (`G4 RTX PRO 6000 Blackwell`, `H100`, `A100`, `L4`, or `T4`) for personal interactive research, forwarded strictly to **`http://localhost:8080`** (`127.0.0.1`) on your local machine over the official Google Colab CLI SSH tunnel.
@@ -95,7 +96,7 @@ While the local SSH tunnel is active, Strata exposes strictly local (`127.0.0.1`
 - **OpenAI-Compatible API**: `http://localhost:8080/v1`
 - **Anthropic Messages API**: `http://localhost:8080/v1/messages`
 
-In the Windows Desktop Launcher (`launcher.bat`), click **`Connect Client`** for ready-to-copy configurations and a one-click helper to update `~/.claude/settings.json` (with confirmation).
+In the Windows Desktop Launcher (`launcher.bat`), click **`Connect Client`** for ready-to-copy configurations and a one-click helper to update `~/.claude/settings.json` (with confirmation), or run **`connect.bat`** / **`./connect.sh [claude|cursor|openai|all]`** (add `claude --apply` to back up and merge `~/.claude/settings.json` from the terminal).
 
 ### Claude Code (`~/.claude/settings.json`)
 
@@ -133,6 +134,7 @@ If you configured a custom `API_KEY` in `config.local.env`, replace `"strata-loc
 | **Restart Strata after editing `config.env` (keeps VM & models)** | `restart.bat` | `./restart.sh` |
 | **Sync presets, stop runtime & stop Compute Unit billing** | `stop.bat` | `./down.sh` |
 | **Check runtime, GPU telemetry, Drive sync & tunnel status** | `status.bat` | `./status.sh` (`--json` for JSON) |
+| **Print or apply coding-agent configs (Claude Code, Cursor, OpenAI SDK)** | `connect.bat` | `./connect.sh [claude\|cursor\|openai\|all] [--apply]` |
 | **Stream live remote logs** | — | `./logs.sh` |
 | **Open an interactive SSH shell on the Colab VM** | — | `./ssh.sh` |
 | **Reconnect the local SSH tunnel to a running VM** | — | `./tunnel.sh` |
@@ -185,6 +187,28 @@ This project is designed for personal interactive research in accordance with th
 - **Always Stop When Finished**: Closing the `start.bat` terminal window (or detaching the tunnel) closes only the local SSH tunnel, **not** the remote Colab VM. Run **`stop.bat`** / `./down.sh`, use **Stop VM & Exit** in `launcher.bat`, or enable `AUTO_STOP_IDLE_MIN` so Compute Units stop being billed.
 - **Google Drive Sync on Stop**: With the default `DRIVE_MODEL_CACHE=0`, stopping the VM syncs tuned presets in `<1s` and terminates immediately. If you enable `DRIVE_MODEL_CACHE=1` and a model backup is actively running when you stop, `down.sh` verifies the backup process is alive and waits (with a bounded timeout) before terminating the VM (press `Ctrl+C` to stop immediately).
 - **Single SSH Connection Multiplexing**: Google Colab runtimes allow one active SSH WebSocket connection at a time. All scripts multiplex over a shared OpenSSH `ControlMaster` socket (`./ssh_config`). Always use `./ssh.sh` rather than `colab ssh` directly.
+
+---
+
+## Offline Testing & CI
+
+All automated test suites run **100% offline** with zero external packages and never start, stop, or mutate a live Google Colab runtime. They run automatically on every push and pull request via [GitHub Actions CI](.github/workflows/ci.yml) (`ubuntu-latest` + `windows-latest`).
+
+**WSL / Linux:**
+
+```bash
+python3 -B -m unittest -v tests/test_repo_hygiene.py
+python3 -B -m unittest -v tests/test_python_helpers.py
+bash tests/test_shell_scripts.sh
+```
+
+**Windows PowerShell (5.1+, no external modules):**
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File tests\StrataHelpers.Tests.ps1
+```
+
+See [`tests/README.md`](tests/README.md) for full details on what each suite verifies.
 
 ---
 
